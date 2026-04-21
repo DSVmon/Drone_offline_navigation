@@ -1,0 +1,51 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 160
+      Enabled: true
+      Name: Grid
+    - Class: rviz_default_plugins/RobotModel
+      Description Source: Topic
+      Description Topic: /robot_description
+      Enabled: true
+      Name: RobotModel
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Image Topic: /camera/image_raw
+      Name: CameraFeed
+    - Class: rviz_default_plugins/Range
+      Enabled: true
+      Name: dToFRange
+      Topic: /sensor/dtof_range
+    - Class: rviz_imu_plugin/Imu
+      Enabled: true
+      Name: IMU
+      Topic: /imu/data
+  Enabled: true
+  Global Options:
+    Fixed Frame: odom
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 5
+      Name: Current View
+      Pitch: 0.3
+      Yaw: 0.8

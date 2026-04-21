@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>drone_simulation</name>
+  <version>0.0.1</version>
+  <description>Gazebo simulation for the Rescue Drone MVP.</description>
+  <maintainer email="architect@drone.rescue">Architect</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>gazebo_ros_pkgs</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>drone_perception</exec_depend>
+  <exec_depend>drone_navigation</exec_depend>
+  <exec_depend>drone_control</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

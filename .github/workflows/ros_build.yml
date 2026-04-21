@@ -1,0 +1,32 @@
+name: ROS 2 Build CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ros:humble-ros-base
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          rosdep update
+          rosdep install --from-paths src --ignore-src -r -y
+
+      - name: Build packages
+        run: |
+          . /opt/ros/humble/setup.sh
+          colcon build --symlink-install
+
+      - name: Run tests
+        run: |
+          . /opt/ros/humble/setup.sh
+          colcon test
+          colcon test-result --all

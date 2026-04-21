@@ -1,0 +1,70 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="cave_world">
+    <include>
+      <uri>model://sun</uri>
+    </include>
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- Simple Tunnel Structure (Hollow) -->
+    <model name="tunnel_walls">
+      <static>true</static>
+
+      <!-- Left Wall -->
+      <link name="left_wall">
+        <pose>10 2.5 1.5 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>20 0.1 3</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>20 0.1 3</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Grey</name></script></material>
+        </visual>
+      </link>
+
+      <!-- Right Wall -->
+      <link name="right_wall">
+        <pose>10 -2.5 1.5 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>20 0.1 3</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>20 0.1 3</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Grey</name></script></material>
+        </visual>
+      </link>
+
+      <!-- Top Wall -->
+      <link name="top_wall">
+        <pose>10 0 3 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>20 5 0.1</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>20 5 0.1</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Grey</name></script></material>
+        </visual>
+      </link>
+
+      <!-- Back Wall -->
+      <link name="back_wall">
+        <pose>20 0 1.5 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>0.1 5 3</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.1 5 3</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Grey</name></script></material>
+        </visual>
+      </link>
+
+    </model>
+
+    <physics type="ode">
+      <real_time_update_rate>1000.0</real_time_update_rate>
+      <max_step_size>0.001</max_step_size>
+    </physics>
+  </world>
+</sdf>
