@@ -1,0 +1,4 @@
+git branch -m init-drone-rescue-ws-13731478115969624986 main
+git fetch origin
+git branch -u origin/main main
+git remote set-head origin -a
