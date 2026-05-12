@@ -2,11 +2,29 @@
 import sys
 from unittest.mock import MagicMock
 
-# Мокаем rclpy и сообщения, так как их нет в среде ассистента
+# Мокаем rclpy и сообщения
+class DummyNode:
+    def __init__(self, name):
+        self.name = name
+    def get_logger(self):
+        return MagicMock()
+    def create_subscription(self, *args, **kwargs):
+        return MagicMock()
+    def create_publisher(self, *args, **kwargs):
+        return MagicMock()
+    def create_timer(self, *args, **kwargs):
+        return MagicMock()
+    def get_clock(self):
+        clock = MagicMock()
+        clock.now.return_value.nanoseconds = 1000
+        return clock
+
 sys.modules['rclpy'] = MagicMock()
 sys.modules['rclpy.node'] = MagicMock()
+sys.modules['rclpy.node'].Node = DummyNode
 sys.modules['geometry_msgs.msg'] = MagicMock()
 sys.modules['std_msgs.msg'] = MagicMock()
+sys.modules['nav_msgs.msg'] = MagicMock()
 
 import os
 import importlib
@@ -15,47 +33,49 @@ sys.path.append(os.path.join(os.getcwd(), 'src', 'drone_control'))
 # Импортируем наш класс
 import drone_control.control_node as control_node
 importlib.reload(control_node)
-from drone_control.control_node import ControlNode, FlightState
+from drone_control.control_node import ControlNode, State
 
 def test_drone_safety_logic():
-    print("Running Logic Test: Drone Safety Interlock...")
+    print("Running Logic Test: Drone Physical Turn (Phase 4.1)...")
     
     # Инициализируем узел
     node = ControlNode()
     
     # 1. Проверяем начальное состояние (Должен лететь вперед)
-    mock_msg = MagicMock()
-    mock_msg.data = False # Препятствий нет
-    node.alert_callback(mock_msg)
-    
-    # Эмулируем один цикл управления
-    # В норме должен публиковать скорость 1.0
     print("Step 1: No obstacles. Checking flight status...")
-    node.control_loop() 
-    # (В реальном ROS тут бы улетело сообщение Twist с linear.x = 1.0)
+    node.control_loop()
+    if node.state == State.MOVING:
+        print("SUCCESS: Drone is in MOVING state.")
+    else:
+        print("FAILED: Drone state is", node.state)
+        return False
     
-    # 2. Имитируем обнаружение препятствия
-    print("Step 2: Obstacle detected! Sending alert...")
+    # 2. Имитируем обнаружение препятствия стереозрением
+    print("Step 2: Stereo obstacle detected! Checking transition to TURNING...")
     alert_msg = MagicMock()
     alert_msg.data = True
-    node.alert_callback(alert_msg)
+    node.front_stereo_callback(alert_msg)
     
-    # Проверяем, изменилось ли состояние в узле
-    if node.obstacle_alert == True:
-        print("SUCCESS: Node recognized the obstacle.")
-    else:
-        print("FAILED: Node ignored the obstacle.")
-        return False
-
-    # 3. Проверяем остановку в цикле управления
     node.control_loop()
-    if node.current_state == FlightState.STOPPED:
-        print("SUCCESS: Drone state changed to STOPPED.")
+    if node.state == State.TURNING:
+        print("SUCCESS: Drone transitioned to TURNING state.")
     else:
-        print("FAILED: Drone state is still", node.current_state)
+        print("FAILED: Drone is still in", node.state)
         return False
 
-    print("\nFINAL RESULT: Logic test PASSED. The code is safe.")
+    # 3. Имитируем завершение разворота
+    print("Step 3: Simulating rotation completion...")
+    # Устанавливаем текущий yaw равным целевому
+    node.current_yaw = node.target_yaw
+    
+    node.control_loop()
+    if node.state == State.MOVING:
+        print("SUCCESS: Drone returned to MOVING state after turn.")
+    else:
+        print("FAILED: Drone failed to finish turn.")
+        return False
+
+    print("\nFINAL RESULT: Logic test PASSED. Physical turn behavior is correct.")
     return True
 
 if __name__ == "__main__":

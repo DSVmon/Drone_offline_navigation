@@ -47,6 +47,7 @@ RUN groupadd --gid $USER_GID $USERNAME \
 # Create workspace
 WORKDIR /drone_ws
 COPY ./src /drone_ws/src
+COPY ./scripts /drone_ws/scripts
 RUN chown -R $USERNAME:$USERNAME /drone_ws
 
 USER $USERNAME

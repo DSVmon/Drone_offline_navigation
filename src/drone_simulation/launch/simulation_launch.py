@@ -5,10 +5,21 @@ from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch.actions import ExecuteProcess
 
 def generate_launch_description():
     pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
     pkg_drone_simulation = get_package_share_directory('drone_simulation')
+    
+    world_path = os.path.join(pkg_drone_simulation, 'worlds', 'cave.world')
+    # Use the script from the scripts directory in the workspace root
+    script_path = "/drone_ws/scripts/procedural_cave.py"
+
+    # 0. Generate procedural cave
+    generate_cave = ExecuteProcess(
+        cmd=['python3', script_path, world_path],
+        output='screen'
+    )
 
     # Gazebo launch
     gazebo = IncludeLaunchDescription(
@@ -41,7 +52,7 @@ def generate_launch_description():
         executable='perception_node',
         name='perception_node',
         output='screen',
-        parameters=[{'min_safe_distance': 0.5, 'use_sim_time': True}]
+        parameters=[{'min_safe_distance': 0.3, 'use_sim_time': True}]
     )
 
     # Navigation Node
@@ -63,6 +74,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        generate_cave,
         gazebo,
         spawn_drone,
         rviz,

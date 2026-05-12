@@ -9,6 +9,8 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - ../src:/drone_ws/src:rw
+      - ../scripts:/drone_ws/scripts:rw
+      - ../logs:/drone_ws/logs:rw
     network_mode: host
     privileged: true
     # Hardware acceleration (NVIDIA example)
