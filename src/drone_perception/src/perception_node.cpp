@@ -11,7 +11,7 @@ public:
   PerceptionNode()
   : Node("perception_node")
   {
-    this->declare_parameter("min_safe_distance", 0.3);
+    this->declare_parameter("min_safe_distance", 0.5);
     min_safe_distance_ = this->get_parameter("min_safe_distance").as_double();
 
     RCLCPP_INFO(this->get_logger(), "Drone Perception Node (Dual dToF Mode) started.");

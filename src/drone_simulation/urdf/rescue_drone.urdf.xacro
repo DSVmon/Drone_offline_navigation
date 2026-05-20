@@ -54,22 +54,26 @@
     </sensor>
   </gazebo>
 
-  <!-- Gazebo ROS State Plugin -->
-  <gazebo>
-    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so"/>
-  </gazebo>
+  <!-- Dummy root link to fix KDL warning and improve stability -->
+  <link name="base_footprint"/>
+  <joint name="base_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
 
-  <!-- Simple Movement Plugin -->
+  <!-- Movement Plugin -->
   <gazebo>
     <plugin name="drone_move_controller" filename="libgazebo_ros_planar_move.so">
       <ros>
         <remapping>cmd_vel:=/cmd_vel</remapping>
+        <remapping>odom:=/odom</remapping>
       </ros>
       <update_rate>50</update_rate>
       <publish_odom>true</publish_odom>
       <publish_odom_tf>true</publish_odom_tf>
       <odometry_frame>odom</odometry_frame>
-      <robot_base_frame>base_link</robot_base_frame>
+      <robot_base_frame>base_footprint</robot_base_frame>
     </plugin>
   </gazebo>
 

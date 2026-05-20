@@ -12,8 +12,14 @@ def generate_launch_description():
     pkg_drone_simulation = get_package_share_directory('drone_simulation')
     
     world_path = os.path.join(pkg_drone_simulation, 'worlds', 'cave.world')
-    # Use the script from the scripts directory in the workspace root
-    script_path = "/drone_ws/scripts/procedural_cave.py"
+    # Find scripts directory relative to the package share directory
+    # share/drone_simulation/launch/simulation_launch.py -> go up 4 levels to workspace root
+    workspace_root = os.path.abspath(os.path.join(pkg_drone_simulation, '..', '..', '..', '..'))
+    script_path = os.path.join(workspace_root, 'scripts', 'procedural_cave.py')
+
+    # Fallback for development (if running from src)
+    if not os.path.exists(script_path):
+        script_path = os.path.join(os.getcwd(), 'scripts', 'procedural_cave.py')
 
     # 0. Generate procedural cave
     generate_cave = ExecuteProcess(
@@ -52,7 +58,7 @@ def generate_launch_description():
         executable='perception_node',
         name='perception_node',
         output='screen',
-        parameters=[{'min_safe_distance': 0.3, 'use_sim_time': True}]
+        parameters=[{'min_safe_distance': 0.5, 'use_sim_time': True}]
     )
 
     # Navigation Node
