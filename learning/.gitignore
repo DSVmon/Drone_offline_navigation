@@ -1,0 +1,6 @@
+checkpoints/
+tensorboard_logs/
+expert_data/
+*.pt
+*.zip
+*.npz

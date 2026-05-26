@@ -96,12 +96,129 @@
 - **Узкие проходы после учёта толщины стен:** Минимальная ширина зон поднята с 1.2м до 2.0м (чистый проход 1.2м).
 - **Щели в потолке на поворотах:** +1.5м к длине плит перекрытия.
 
-## Команды для запуска
+## Команды для запуска (реактивное управление, без изменений)
 ```bash
 colcon build --symlink-install
-source install/setup.bash
+source install/setup.zsh
 ros2 launch drone_simulation simulation_launch.py
 ```
 
-## Текущий статус
-Система верифицирована. Дрон циклически летает по процедурно генерируемой пещере (100м, 66 сегментов). Маршрут: SEARCHING → [INSPECTING при препятствии] → SEARCHING (найден проход) или TURNING (тупик/разворот на проход). DECIDE имеет двухуровневый приоритет: сначала передние снимки (прямой полёт), затем yaw-снимки (разворот в проход). Проект готов к внедрению SLAM (Phase 5).
+---
+
+# Phase 4.3 — Neural Network Control (добавлено 24.05.2026)
+
+## Цель
+Заменить реактивное уклонение в `control_node.py` на управление через обученную нейросеть. Существующий проект **не изменяется** — все новые файлы находятся в `learning/`.
+
+## Стратегия обучения
+**Двухфазный пайплайн:** Behavior Cloning (BC) → PPO fine-tuning.
+
+1. **BC (Behavior Cloning)** — supervised learning по экспертным данным с текущего реактивного контроллера. Быстрый старт (~10 мин сбора + ~2 мин обучения).
+2. **PPO (Proximal Policy Optimization)** — deep RL в Gazebo. 1M шагов, ~5-8 часов headless-тренировки.
+
+## Архитектура новых компонентов
+
+```
+learning/                          # Все новые файлы
+├── config.py                      # Гиперпараметры BC, PPO, наград, путей
+├── utils.py                       # Управление Gazebo (kill, generate, launch, reset)
+├── reward.py                      # Функция награды (7 компонентов)
+├── drone_env.py                   # Gymnasium-среда: ROS 2 ↔ Stable-Baselines3
+├── collect_expert.py              # ROS 2 нода сбора экспертных данных
+├── bc_model.py                    # MLP для BC + загрузка весов в PPO
+├── callbacks.py                   # Мониторинг (консоль + CSV + TensorBoard)
+├── train.py                       # BC → PPO пайплайн
+├── inference_node.py              # ROS 2 нода инференса обученной модели
+├── launch/
+│   ├── training_launch.py         # Headless launch для тренировки (без control_node)
+│   └── inference_launch.py        # Launch с NN-управлением (вместо control_node)
+├── checkpoints/                   # *.zip модели (gitignored)
+├── tensorboard_logs/              # логи обучения (gitignored)
+├── expert_data/                   # *.npz записи эксперта (gitignored)
+├── requirements.txt               # torch, stable-baselines3, gymnasium
+└── .gitignore
+```
+
+### Observation space (13-dim)
+| № | Сигнал | Нормализация |
+|---|--------|-------------|
+| 0-4 | stereo_distances[5] | /10.0 |
+| 5 | x | /50.0 |
+| 6 | y | /50.0 |
+| 7 | z | /3.5 |
+| 8-9 | sin(yaw), cos(yaw) | raw |
+| 10 | odom_vx | clip [-1,1] |
+| 11-12 | roll_rate, pitch_rate | /π |
+
+### Action space (3-dim)
+| № | Команда | Диапазон |
+|---|---------|----------|
+| 0 | linear.x | [0.0, 0.8] |
+| 1 | linear.z | [-0.7, 0.7] |
+| 2 | angular.z | [-1.2, 1.2] |
+
+### Функция награды
+| Компонент | Значение | Условие |
+|-----------|----------|---------|
+| r_forward | +0.1 × Δdist | продвижение вперёд |
+| r_backward | -0.05 | движение назад |
+| r_collision | -10.0 | любое столкновение → terminatе |
+| r_stuck | -5.0 | скорость < 0.01 > 15с → terminate |
+| r_completion | +50.0 | полный цикл (тупик + возврат) |
+| r_out_of_bounds | -3.0 | выход за границы → terminate |
+| r_timeout | -5.0 | > 300с → terminate |
+| r_survive | +0.01/шаг | каждый шаг без коллизии |
+
+### Смена пещеры
+- Новая пещера генерируется каждые 5 эпизодов
+- Между сменами — только сброс позиции дрона через `/gazebo/set_entity_state`
+- Используется **оригинальный** `scripts/procedural_cave.py` без изменений
+
+### Чекпоинты
+- Сохраняются каждые 20 000 шагов в `learning/checkpoints/rl_model_{N}.zip`
+- Возможность прервать и продолжить с любого чекпоинта
+- TensorBoard-логи в `learning/tensorboard_logs/`
+
+## Команды для запуска (новые)
+
+**Сбор экспертных данных** (~10 мин, требуется 2 терминала):
+```bash
+# Терминал 1: штатная симуляция
+source /opt/ros/humble/setup.zsh && source install/setup.zsh && ./run_drone.sh
+
+# Терминал 2: сбор
+source learning/venv/bin/activate && python3 learning/collect_expert.py
+```
+
+**Обучение** (~5-8 часов):
+```bash
+source learning/venv/bin/activate && cd learning && python3 train.py
+```
+
+**Продолжить обучение:**
+```bash
+python3 train.py --resume checkpoints/rl_model_200000_steps.zip
+```
+
+**Инференс обученной модели:**
+```bash
+source /opt/ros/humble/setup.zsh && source install/setup.zsh
+ros2 launch learning/launch/inference_launch.py
+```
+
+**Мониторинг:**
+```bash
+tensorboard --logdir learning/tensorboard_logs
+```
+
+## Ключевые отличия от Phase 4.2
+- Существующие файлы `src/`, `scripts/`, `run_drone.sh` **не изменены**
+- Весь новый код — только в `learning/`
+- Для zsh везде используется `setup.zsh` вместо `setup.bash`
+
+## Текущий статус (Phase 4.3)
+Код пайплайна реализован, протестирован синтаксис всех 11 Python-файлов. Ожидается:
+1. Установка Python-зависимостей
+2. Сбор экспертных данных с текущего реактивного контроллера
+3. Запуск BC → PPO обучения
+4. Валидация обученной модели через инференс

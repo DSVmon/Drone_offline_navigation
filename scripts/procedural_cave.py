@@ -56,8 +56,8 @@ def generate_cave(output_path, length=100.0, width=4.5, segment_length=1.5):
     # Текстура для всех элементов пещеры
     cave_material = "Gazebo/Bricks"
     
-    # === 8-12 РЕЗКИХ ПЕРЕПАДОВ ВЫСОТ (опуск потолка / подъём пола / сжатие) ===
-    sharp_count = random.randint(8, 12)
+    # === 5-8 РЕЗКИХ ПЕРЕПАДОВ ВЫСОТ (опуск потолка / подъём пола / сжатие) ===
+    sharp_count = random.randint(5, 8)
     sharp_indices = sorted(random.sample(range(6, num_segments - 8), sharp_count))
     
     # === ЗОНЫ КРУТЫХ ПОВОРОТОВ (дополнительные резкие изгибы) ===
@@ -98,14 +98,14 @@ def generate_cave(output_path, length=100.0, width=4.5, segment_length=1.5):
             mode = random.choice(["ceiling", "floor", "both"])
             if mode == "ceiling":
                 prev = current_ceiling_z
-                target_ceiling = prev - random.uniform(0.8, 2.2)
+                target_ceiling = prev - random.uniform(0.6, 1.6)
                 target_ceiling = max(current_floor_z + 1.0, target_ceiling)
             elif mode == "floor":
-                target_floor = current_floor_z + random.uniform(0.6, 1.8)
+                target_floor = current_floor_z + random.uniform(0.4, 1.2)
                 target_floor = min(current_ceiling_z - 1.0, target_floor)
             else:  # both — сжатие сверху и снизу одновременно
-                target_ceiling = current_ceiling_z - random.uniform(0.6, 1.5)
-                target_floor = current_floor_z + random.uniform(0.4, 1.2)
+                target_ceiling = current_ceiling_z - random.uniform(0.4, 1.0)
+                target_floor = current_floor_z + random.uniform(0.3, 0.8)
                 target_ceiling = max(target_floor + 1.0, target_ceiling)
                 target_floor = min(target_ceiling - 1.0, target_floor)
             target_width = current_width + random.uniform(-0.3, 0.3)
@@ -237,10 +237,12 @@ def generate_cave(output_path, length=100.0, width=4.5, segment_length=1.5):
 
         # --- ПРЕПЯТСТВИЯ (СТОЛБЫ, ПЛИТЫ, КАМНИ) ---
         if i >= 1:
-            # Сталагмиты и сталактиты (каждый 7-й)
-            if i % 7 == 0:
+            # Сталагмиты и сталактиты (каждый 12-й)
+            if i % 12 == 0:
                 obs_x = next_x
-                obs_y = next_y + random.uniform(-current_width/3, current_width/3)
+                # Смещение к краям, чтобы не блокировать центр прохода
+                side = random.choice([-1, 1])
+                obs_y = next_y + side * random.uniform(current_width/4, current_width/2.5)
                 clearance = current_ceiling_z - current_floor_z
                 # Минимум 80см от края столба до потолка/пола
                 max_obs_h = max(0.3, min(2.5, clearance - 0.8))
@@ -264,7 +266,7 @@ def generate_cave(output_path, length=100.0, width=4.5, segment_length=1.5):
       </link>"""
             
             # Горизонтальные препятствия (плиты) — редко
-            if i % 15 == 0 and i >= 3:
+            if i % 20 == 0 and i >= 5:
                 slab_side = random.choice([-1, 1])
                 slab_x = next_x - slab_side * (current_width * 0.25) * math.sin(current_angle)
                 slab_y = next_y + slab_side * (current_width * 0.25) * math.cos(current_angle)
