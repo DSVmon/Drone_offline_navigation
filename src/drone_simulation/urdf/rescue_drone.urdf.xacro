@@ -29,8 +29,10 @@
     </collision>
   </link>
 
-  <!-- Gazebo Material for Base Link and Bumper -->
+  <!-- Gazebo settings for Base Link: visual, bumper sensor, gravity -->
   <gazebo reference="base_link">
+    <material>Gazebo/Grey</material>
+    <gravity>0</gravity>
     <visual>
       <material>
         <ambient>1.0 0.5 0.0 1.0</ambient>
@@ -99,7 +101,7 @@
   <joint name="camera_left_joint" type="fixed">
     <parent link="camera_link"/>
     <child link="camera_left_link"/>
-    <origin xyz="0 0.03 0" rpy="0 0 0"/>
+    <origin xyz="0 0.06 0" rpy="0 0 0"/>
   </joint>
 
   <!-- Right Camera -->
@@ -115,7 +117,7 @@
   <joint name="camera_right_joint" type="fixed">
     <parent link="camera_link"/>
     <child link="camera_right_link"/>
-    <origin xyz="0 -0.03 0" rpy="0 0 0"/>
+    <origin xyz="0 -0.06 0" rpy="0 0 0"/>
   </joint>
 
   <!-- IMU -->
@@ -166,8 +168,8 @@
       <camera name="left">
         <horizontal_fov>1.3962634</horizontal_fov>
         <image>
-          <width>800</width>
-          <height>600</height>
+          <width>640</width>
+          <height>480</height>
           <format>R8G8B8</format>
         </image>
         <clip>
@@ -193,8 +195,8 @@
       <camera name="right">
         <horizontal_fov>1.3962634</horizontal_fov>
         <image>
-          <width>800</width>
-          <height>600</height>
+          <width>640</width>
+          <height>480</height>
           <format>R8G8B8</format>
         </image>
         <clip>
@@ -209,7 +211,7 @@
         </ros>
         <camera_name>right</camera_name>
         <frame_name>camera_right_link</frame_name>
-        <hack_baseline>0.06</hack_baseline>
+        <hack_baseline>0.12</hack_baseline>
       </plugin>
     </sensor>
   </gazebo>
@@ -283,11 +285,6 @@
         <frame_name>dtof_back_link</frame_name>
       </plugin>
     </sensor>
-  </gazebo>
-
-  <gazebo reference="base_link">
-    <material>Gazebo/Grey</material>
-    <gravity>0</gravity>
   </gazebo>
 
 </robot>

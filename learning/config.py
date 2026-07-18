@@ -1,6 +1,13 @@
-import os
-import torch
+"""
+Configuration for Drone RL Training (MAVRL architecture).
+
+Architecture: CNN encoder → LSTM → Actor/Critic
+Input: depth map 256×256 + 7-dim goal-oriented state
+Action: 4-dim velocity commands (vx, vy, vz, yaw_rate)
+"""
+
 from pathlib import Path
+import numpy as np
 
 LEARNING_DIR = Path(__file__).parent
 PROJECT_ROOT = LEARNING_DIR.parent
@@ -9,10 +16,11 @@ PROJECT_ROOT = LEARNING_DIR.parent
 HEADLESS = True
 CAVE_CHANGE_INTERVAL = 20
 EPISODE_TIMEOUT_SEC = 600
-DT = 0.05
+DT = 0.033  # 30Hz (matching MAVRL)
 SIM_STEP_TIMEOUT = 2
 
 # --- ROS 2 Topics ---
+TOPIC_DEPTH_MAP = "/navigation_node/depth_map"
 TOPIC_STEREO_DISTANCES = "/navigation_node/stereo_distances"
 TOPIC_ODOM = "/odom"
 TOPIC_IMU = "/imu/data"
@@ -20,41 +28,67 @@ TOPIC_CMD_VEL = "/cmd_vel"
 TOPIC_COLLISIONS = "/drone/collisions"
 SERVICE_SET_ENTITY_STATE = "/gazebo/set_entity_state"
 
-# --- BC (Behavior Cloning) ---
-BC_EXPERT_SAMPLES = 50_000
-BC_EPOCHS = 500
-BC_LR = 1e-3
-BC_LR_PATIENCE = 30
-BC_LR_FACTOR = 0.5
-BC_MIN_LR = 1e-6
-BC_BATCH_SIZE = 512
-BC_HIDDEN = [256, 256]
-BC_VAL_SPLIT = 0.15
+# --- Depth Map ---
+DEPTH_WIDTH = 256
+DEPTH_HEIGHT = 256
+DEPTH_MIN = 0.1    # meters
+DEPTH_MAX = 12.0   # meters
+DEPTH_CHANNELS = 1  # grayscale
 
-# --- PPO ---
-TOTAL_TIMESTEPS = 2_000_000
+# --- Observation Space ---
+# Image: depth map 256×256 (uint8, 0-255)
+# State: 7-dim goal-oriented (MAVRL style)
+#   [log_distance, horizon_vel, theta, horizon_vel_dire, delta_z, vel_body_z, yaw]
+STATE_DIM = 7
+
+# --- Action Space (body-frame accelerations, matching MAVRL) ---
+ACTION_DIM = 4
+# Acceleration limits (m/s² for linear, rad/s for angular)
+# MAVRL: act_max=[4.0, 4.0, 1.0, 0.6], act_min=[-4.0, -4.0, -1.0, -0.6]
+ACTION_ACC_MAX = np.array([4.0, 4.0, 1.0])
+ACTION_YAW_RATE_MAX = 0.6
+# For normalization: action = raw * ACTION_STD + ACTION_MEAN
+ACTION_MEAN = np.array([0.0, 0.0, 0.0, 0.0])
+ACTION_STD = np.array([4.0, 4.0, 1.0, 0.6])
+
+# --- Goal-point ---
+# Goal = 80% of cave length along entrance heading
+GOAL_DISTANCE_RATIO = 0.8
+CAVE_LENGTH = 100.0  # meters (all generators produce 100m caves)
+GOAL_Z = 1.75  # target altitude
+GOAL_REACHED_THRESHOLD = 2.0  # meters
+
+# --- Network Architecture (MAVRL) ---
+FEATURES_DIM = 64       # VAE latent dim
+LSTM_HIDDEN_SIZE = 256
+LSTM_NUM_LAYERS = 1
+ACTOR_HIDDEN = [256, 256]
+CRITIC_HIDDEN = [512, 512]
+ACTIVATION_FN = "relu"
+
+# --- RecurrentPPO Hyperparameters ---
+TOTAL_TIMESTEPS = 8_000_000
 LEARNING_RATE = 1e-4
-N_STEPS = 4096
-BATCH_SIZE = 128
-N_EPOCHS = 20
-GAMMA = 0.995
+LEARNING_RATE_END = 1e-5  # Linear decay: start 1e-4, end 1e-5 (MAVRL style)
+N_STEPS = 1000          # steps per rollout per env
+N_SEQ = 1               # sequence length for LSTM
+BATCH_SIZE = 4000
+N_EPOCHS = 10
+GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_RANGE = 0.2
-ENT_COEF = 0.05
-VF_COEF = 0.5
+ENT_COEF = 0.0
+VF_COEF = 0.2
 MAX_GRAD_NORM = 0.5
-POLICY_KWARGS = {
-    "net_arch": [256, 256],
-    "activation_fn": torch.nn.ReLU,
-}
+USE_TANH_ACT = True
 
 # --- Checkpoints ---
 CHECKPOINT_DIR = LEARNING_DIR / "checkpoints"
 SAVE_FREQ = 20_000
 LOG_DIR = LEARNING_DIR / "tensorboard_logs"
-EXPERT_DIR = LEARNING_DIR / "expert_data"
+DATA_DIR = LEARNING_DIR / "depth_data"
 
-# --- Paths to project scripts ---
+# --- Paths ---
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 CAVE_WORLD_PATH = (
     Path(__file__).parent.parent
@@ -64,20 +98,23 @@ CAVE_WORLD_PATH = (
     / "cave.world"
 )
 
-# --- Rewards (per-step) ---
+# --- Rewards (per-step, matching MAVRL) ---
 R_SURVIVE = 0.01
-R_SPEED_COEFF = 0.03
-R_PROGRESS_COEFF = 5.0
-R_PROXIMITY_COEFF = -0.05
+R_GOAL_COEFF = 5.0        # progress toward goal (replaces distance_coeff)
+R_SPEED_COEFF = 0.03      # speed bonus (adaptive)
+R_PROXIMITY_PENALTY = -0.1
 R_PROXIMITY_THRESHOLD = 0.5
-R_APPROACH_COEFF = -0.2
-R_APPROACH_THRESHOLD = 0.005
-R_CENTERING_COEFF = 0.01
-R_CENTERING_THRESHOLD = 4.0
+R_CENTERING_COEFF = 0.15
+
+# MAVRL-style action penalties (smooth flight)
+R_ANGULAR_PENALTY = -0.003    # angle_vel_coeff: penalty for angular velocity
+R_INPUT_PENALTY = -0.0005     # input_coeff: penalty for action changes
+R_YAW_PENALTY = -0.003        # yaw_coeff: penalty for yaw rate
+R_VERTICAL_PENALTY = -0.002   # vert_coeff: penalty for vertical input changes
 
 # --- Rewards (terminal) ---
-R_COLLISION = -15.0
-R_COMPLETION = 50.0
+R_COLLISION = -5.0
+R_COMPLETION = 50.0       # reached goal
 R_STUCK = -5.0
 R_TIMEOUT = -3.0
 R_OUT_OF_BOUNDS = -10.0
@@ -87,46 +124,32 @@ DRONE_NAME = "rescue_drone"
 DRONE_SPAWN_Z = 1.0
 DRONE_MIN_Z = 0.1
 DRONE_MAX_Z = 3.5
-DRONE_MAX_YAW = 3.14  # Allow full rotation (π rad = 180°)
-BOUNDS_XY = 110.0
+BOUNDS_XY = 120.0
 
-# --- Observation normalization ---
-OBS_STEREO_MAX = 10.0
-OBS_POS_MAX = 50.0
-OBS_Z_MAX = 3.5
-
-# --- Action limits ---
-ACTION_VX_MIN = 0.0
-ACTION_VX_MAX = 1.5
-ACTION_VZ_MIN = -0.5
-ACTION_VZ_MAX = 0.5
-ACTION_YAW_MIN = -1.0
-ACTION_YAW_MAX = 1.0
-
-# --- Curriculum ---
+# --- Curriculum (parametric, MAVRL-style) ---
 CURRICULUM_STAGES = [
-    {"name": "straight", "cave_script": "straight_cave.py", "progress_coeff": 1.0, "proximity_coeff": -0.05, "proximity_threshold": 0.5},
-    {"name": "gentle", "cave_script": "gentle_cave.py", "progress_coeff": 0.7, "proximity_coeff": -0.10, "proximity_threshold": 0.5},
-    {"name": "full", "cave_script": "procedural_cave.py", "progress_coeff": 0.5, "proximity_coeff": -0.15, "proximity_threshold": 0.5},
+    {
+        "name": "easy",
+        "cave_script": "straight_cave.py",
+        "cave_width": 8.0,
+        "turn_angle_max": 0,
+        "obstacle_density": 0.0,
+    },
+    {
+        "name": "medium",
+        "cave_script": "gentle_cave.py",
+        "cave_width": 5.0,
+        "turn_angle_max": 30,
+        "obstacle_density": 0.3,
+    },
+    {
+        "name": "hard",
+        "cave_script": "procedural_cave.py",
+        "cave_width": 3.5,
+        "turn_angle_max": 55,
+        "obstacle_density": 0.6,
+    },
 ]
-CURRICULUM_STAGE_STEPS = 500_000
+CURRICULUM_STAGE_STEPS = 2_000_000
 CURRICULUM_ADVANCE_THRESHOLD = 0.8
 CURRICULUM_REGRESS_THRESHOLD = 0.3
-
-
-def normalize_action(raw_action):
-    """Map raw cmd_vel (physical) to normalized [-1, 1] for BC→PPO weight transfer."""
-    import numpy as np
-    vx = np.interp(raw_action[..., 0], [ACTION_VX_MIN, ACTION_VX_MAX], [-1.0, 1.0])
-    vz = np.interp(raw_action[..., 1], [ACTION_VZ_MIN, ACTION_VZ_MAX], [-1.0, 1.0])
-    yaw = np.interp(raw_action[..., 2], [ACTION_YAW_MIN, ACTION_YAW_MAX], [-1.0, 1.0])
-    return np.stack([vx, vz, yaw], axis=-1).astype(np.float32)
-
-
-def denormalize_action(norm_action):
-    """Map normalized [-1, 1] back to raw cmd_vel (physical)."""
-    import numpy as np
-    vx = np.interp(norm_action[..., 0], [-1.0, 1.0], [ACTION_VX_MIN, ACTION_VX_MAX])
-    vz = np.interp(norm_action[..., 1], [-1.0, 1.0], [ACTION_VZ_MIN, ACTION_VZ_MAX])
-    yaw = np.interp(norm_action[..., 2], [-1.0, 1.0], [ACTION_YAW_MIN, ACTION_YAW_MAX])
-    return np.stack([vx, vz, yaw], axis=-1).astype(np.float32)

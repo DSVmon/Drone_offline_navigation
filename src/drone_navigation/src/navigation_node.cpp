@@ -25,10 +25,16 @@ public:
   {
     // ... (existing parameters)
     
-    // Create OpenCV window for automatic visualization
-    cv::namedWindow("Drone View: Rectified Left", cv::WINDOW_AUTOSIZE);
-    cv::namedWindow("Drone View: Disparity", cv::WINDOW_AUTOSIZE);
-    cv::startWindowThread();
+    // Create OpenCV window for automatic visualization (skip in headless)
+    try {
+      cv::namedWindow("Drone View: Rectified Left", cv::WINDOW_AUTOSIZE);
+      cv::namedWindow("Drone View: Disparity", cv::WINDOW_AUTOSIZE);
+      cv::startWindowThread();
+      headless_ = false;
+    } catch (...) {
+      RCLCPP_WARN(this->get_logger(), "Cannot create OpenCV windows (headless mode)");
+      headless_ = true;
+    }
 
     // Initialize BM (Block Matching) - Much faster than SGBM for real-time performance
     int num_disparities = 64; 
@@ -61,11 +67,11 @@ public:
 
     RCLCPP_INFO(this->get_logger(), "Drone Navigation Node (Stereo VIO Wrapper) started.");
 
-    // Publisher for Odometry
-    odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("~/odom", 10);
-
     // Publisher for Stereo-based multi-zone distance data
     stereo_dist_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("~/stereo_distances", 10);
+
+    // Publisher for depth map (MAVRL architecture: 256x256 float32)
+    depth_map_pub_ = this->create_publisher<sensor_msgs::msg::Image>("~/depth_map", 10);
 
     // Odom subscriber for calibration
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -153,9 +159,11 @@ private:
       cv::pyrDown(left_rect_full, left_rect);
       cv::pyrDown(right_rect_full, right_rect);
 
-      // 4. Automatic Window Display
-      cv::imshow("Drone View: Rectified Left", left_rect);
-      cv::waitKey(1);
+      // 4. Automatic Window Display (skip in headless)
+      if (!headless_) {
+        cv::imshow("Drone View: Rectified Left", left_rect);
+        cv::waitKey(1);
+      }
 
       // 5. Compute Disparity Map
       cv::Mat disparity_16s, disparity_8u;
@@ -227,22 +235,64 @@ private:
         }
       }
 
-      // Show windows with debug overlays
-      cv::imshow("Drone View: Rectified Left", debug_rect);
-      
-      cv::Mat disparity_with_roi = disparity_8u.clone();
-      for (size_t zone = 0; zone < rois.size(); ++zone) {
-        cv::Scalar color = (zone == 1) ? cv::Scalar(0, 255, 0) : cv::Scalar(255, 0, 0);
-        if (zone >= 3) color = cv::Scalar(0, 255, 255);
-        cv::rectangle(disparity_with_roi, rois[zone], color, 2);
+      // Show windows with debug overlays (skip in headless)
+      if (!headless_) {
+        cv::imshow("Drone View: Rectified Left", debug_rect);
+        
+        cv::Mat disparity_with_roi = disparity_8u.clone();
+        for (size_t zone = 0; zone < rois.size(); ++zone) {
+          cv::Scalar color = (zone == 1) ? cv::Scalar(0, 255, 0) : cv::Scalar(255, 0, 0);
+          if (zone >= 3) color = cv::Scalar(0, 255, 255);
+          cv::rectangle(disparity_with_roi, rois[zone], color, 2);
+        }
+        cv::imshow("Drone View: Disparity", disparity_with_roi);
+        cv::waitKey(1);
       }
-      cv::imshow("Drone View: Disparity", disparity_with_roi);
-      cv::waitKey(1);
 
       // Publish multi-zone distances
       auto dist_msg = std_msgs::msg::Float32MultiArray();
       dist_msg.data = zone_min_dists;
       stereo_dist_pub_->publish(dist_msg);
+
+      // 7. Depth Map for MAVRL (disparity → depth in meters → uint8 [0,255])
+      // Convert disparity to depth: Z = f * B / d
+      cv::Mat depth_map_32f;
+      disp_visible.copyTo(depth_map_32f);
+
+      float focal_length = stereo_model_.left().fx() * 0.5; // half-res
+      float baseline = stereo_model_.baseline();
+
+      for (int v = 0; v < depth_map_32f.rows; ++v) {
+        for (int u = 0; u < depth_map_32f.cols; ++u) {
+          float disp = depth_map_32f.at<float>(v, u);
+          if (disp > 0.1f) {
+            float z = (focal_length * baseline) / disp;
+            depth_map_32f.at<float>(v, u) = std::min(z, 12.0f); // clamp max 12m
+          } else {
+            depth_map_32f.at<float>(v, u) = 12.0f; // far = no data
+          }
+        }
+      }
+
+      // Normalize to [0, 255] uint8 (matching MAVRL format)
+      cv::Mat depth_map_uint8;
+      depth_map_32f.convertTo(depth_map_uint8, CV_8U, 255.0 / 12.0);
+
+      // Center crop to square (matching MAVRL)
+      int crop_size = std::min(depth_map_uint8.cols, depth_map_uint8.rows);
+      int crop_x = (depth_map_uint8.cols - crop_size) / 2;
+      int crop_y = (depth_map_uint8.rows - crop_size) / 2;
+      cv::Mat depth_cropped = depth_map_uint8(cv::Rect(crop_x, crop_y, crop_size, crop_size));
+
+      // Resize to 256x256 for MAVRL policy input
+      cv::Mat depth_map_resized;
+      cv::resize(depth_cropped, depth_map_resized, cv::Size(256, 256), 0, 0, cv::INTER_AREA);
+
+      // Publish depth map as mono8 image (0-255, matching MAVRL)
+      auto depth_header = left_msg->header;
+      depth_header.frame_id = "camera_link";
+      auto depth_img_msg = cv_bridge::CvImage(depth_header, "mono8", depth_map_resized).toImageMsg();
+      depth_map_pub_->publish(*depth_img_msg);
 
       auto debug_img_msg = cv_bridge::CvImage(left_msg->header, "bgr8", debug_rect).toImageMsg();
       rectified_pub_->publish(*debug_img_msg);
@@ -251,18 +301,6 @@ private:
       RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
       return;
     }
-
-    auto odom_msg = nav_msgs::msg::Odometry();
-    odom_msg.header.stamp = this->now();
-    odom_msg.header.frame_id = "odom";
-    odom_msg.child_frame_id = "base_link";
-
-    // Fill with placeholder position
-    odom_msg.pose.pose.position.x = 0.0;
-    odom_msg.pose.pose.position.y = 0.0;
-    odom_msg.pose.pose.position.z = 1.0;
-
-    odom_pub_->publish(odom_msg);
   }
 
   typedef message_filters::sync_policies::ApproximateTime<
@@ -280,11 +318,12 @@ private:
   image_geometry::StereoCameraModel stereo_model_;
   cv::Ptr<cv::StereoBM> bm_;
   bool model_initialized_ = false;
+  bool headless_ = false;
   double current_x_ = 0.0;
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr stereo_dist_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr rectified_pub_;
 };
 

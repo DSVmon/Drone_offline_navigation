@@ -1,7 +1,17 @@
+"""
+Gymnasium environment for drone RL training (MAVRL architecture).
+
+Observation: Dict{'image': depth map 256×256, 'state': 7-dim goal-oriented}
+Action: 4-dim body-frame accelerations (ax, ay, az, yaw_rate)
+Reward: goal-oriented with adaptive speed
+"""
+
 import time
 import math
 import threading
 from collections import deque
+
+import cv2
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -11,18 +21,16 @@ from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Image
 from gazebo_msgs.msg import ContactsState, EntityState
 from gazebo_msgs.srv import SetEntityState
+from cv_bridge import CvBridge
 
 import config
-from reward import compute_reward
-import utils
-from curriculum import CurriculumManager
 
 
 class DroneEnv(gym.Env):
-    """Gymnasium environment wrapping ROS 2 / Gazebo for drone RL training."""
+    """Gymnasium environment wrapping ROS 2 / Gazebo for MAVRL training."""
 
     def __init__(self, headless=None, seed=None, node_name="drone_env_node"):
         super().__init__()
@@ -30,34 +38,33 @@ class DroneEnv(gym.Env):
         self.headless = headless if headless is not None else config.HEADLESS
         self.episode_count = 0
         self.gazebo_proc = None
+        self.bridge = CvBridge()
 
-        # --- Observation space ---
-        # 14-dim: stereo[5], x, y, z, sin(yaw), cos(yaw), vx, vz, roll/pi, pitch/pi
-        obs_low = np.array([
-            0.0, 0.0, 0.0, 0.0, 0.0,
-            -1.0, -1.0, 0.0,
-            -1.0, -1.0,
-            -1.0, -1.0,
-            -1.0, -1.0,
-        ], dtype=np.float32)
-        obs_high = np.array([
-            1.5, 1.5, 1.5, 1.5, 1.5,
-            1.0, 1.0, 1.0,
-            1.0, 1.0,
-            1.0, 1.0,
-            1.0, 1.0,
-        ], dtype=np.float32)
-        self.observation_space = spaces.Box(obs_low, obs_high, dtype=np.float32)
+        # --- Observation space (Dict) ---
+        self.observation_space = spaces.Dict({
+            'image': spaces.Box(
+                low=0, high=255,
+                shape=(config.DEPTH_CHANNELS, config.DEPTH_HEIGHT, config.DEPTH_WIDTH),
+                dtype=np.uint8,
+            ),
+            'state': spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(config.STATE_DIM,),
+                dtype=np.float64,
+            ),
+        })
 
-        # --- Action space ---
-        # linear.x, linear.z, angular.z
+        # --- Action space (body-frame accelerations) ---
         self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+            low=-1.0, high=1.0,
+            shape=(config.ACTION_DIM,),
             dtype=np.float32,
         )
 
         # --- Internal state ---
+        self.depth_image = np.zeros(
+            (config.DEPTH_HEIGHT, config.DEPTH_WIDTH), dtype=np.uint8
+        )
         self.stereo_distances = [10.0, 10.0, 10.0, 10.0, 10.0]
         self.current_x = 0.0
         self.current_y = 0.0
@@ -72,68 +79,79 @@ class DroneEnv(gym.Env):
         self.collision_type = "NONE"
         self._collision_countdown = 0
 
+        # Velocity tracking (for acceleration-based control)
+        self.vel_world = np.array([0.0, 0.0, 0.0])
+
+        # Goal-point
+        self.goal_point = np.array([config.CAVE_LENGTH * config.GOAL_DISTANCE_RATIO, 0.0, config.GOAL_Z])
+        self.entrance_heading = None
+
+        # Previous state
         self.prev_x = 0.0
         self.prev_y = 0.0
         self.prev_yaw = 0.0
-        self.entrance_heading = None
-        self.elapsed_time = 0.0
-        self.stuck_start_time = None
-        self.completed_lap = False
 
-        self._obs_timestamp = 0
-        self._last_step_timestamp = 0
+        # Step tracking
         self._step_count = 0
         self._episode_start_time = None
-
-        self._pos_history = deque(maxlen=100)
-        self._vx_sign_history = []
-        self._prev_distances = [10.0, 10.0, 10.0, 10.0, 10.0]
-        self._flight_history = deque(maxlen=5)  # last 5 flight paths
-        self._current_flight_path = []
+        self._obs_timestamp = 0
+        self._last_step_timestamp = 0
         self._near_wall_count = 0
+
+        # Stuck detection
+        self._pos_history = deque(maxlen=100)
+
+        # Image memory (for LSTM sequences)
+        self._image_memory = deque(maxlen=10)
+        self._state_memory = deque(maxlen=10)
+
+        # Gazebo restart
         self._gazebo_restart_needed = False
         self._gazebo_restart_count = 0
         self._gazebo_stale_steps = 0
 
+        # Previous action
         self.last_vx_cmd = 0.0
         self.last_vz_cmd = 0.0
         self.last_yaw_cmd = 0.0
 
-        # Curriculum
-        self.curriculum = CurriculumManager()
+        # Action tracking for penalties (MAVRL-style)
+        self.prev_action = np.zeros(4, dtype=np.float32)
+        self.prev_angular_vel = 0.0
+        self.prev_vz_input = 0.0
+        self._saved_prev_action = np.zeros(4, dtype=np.float32)
+        self._saved_prev_angular_vel = 0.0
+        self._saved_prev_vz_input = 0.0
 
         # ROS 2
         if not rclpy.ok():
             rclpy.init()
         self.node = Node(node_name)
 
+        # Subscribers
+        self._sub_depth = self.node.create_subscription(
+            Image, config.TOPIC_DEPTH_MAP, self._depth_callback, 10
+        )
         self._sub_stereo = self.node.create_subscription(
-            Float32MultiArray,
-            config.TOPIC_STEREO_DISTANCES,
-            self._stereo_callback,
-            10,
+            Float32MultiArray, config.TOPIC_STEREO_DISTANCES,
+            self._stereo_callback, 10
         )
         self._sub_odom = self.node.create_subscription(
-            Odometry,
-            config.TOPIC_ODOM,
-            self._odom_callback,
-            10,
+            Odometry, config.TOPIC_ODOM, self._odom_callback, 10
         )
         self._sub_collisions = self.node.create_subscription(
-            ContactsState,
-            config.TOPIC_COLLISIONS,
-            self._collision_callback,
-            10,
+            ContactsState, config.TOPIC_COLLISIONS, self._collision_callback, 10
         )
 
-        self._cmd_vel_pub = self.node.create_publisher(
-            Twist, config.TOPIC_CMD_VEL, 10
-        )
+        # Publishers
+        self._cmd_vel_pub = self.node.create_publisher(Twist, config.TOPIC_CMD_VEL, 10)
 
+        # Gazebo service for Z-axis
         self._gz_set_state_client = self.node.create_client(
             SetEntityState, config.SERVICE_SET_ENTITY_STATE
         )
 
+        # Background ROS spin
         self._spin_thread = threading.Thread(target=self._spin, daemon=True)
         self._spin_running = True
         self._spin_thread.start()
@@ -141,18 +159,31 @@ class DroneEnv(gym.Env):
         self._lock = threading.Lock()
 
     def _spin(self):
-        """Background thread spinning ROS 2."""
         while self._spin_running and rclpy.ok():
             try:
                 rclpy.spin_once(self.node, timeout_sec=0.01)
             except Exception:
-                pass  # Ignore threading errors
+                pass
+
+    # --- Callbacks ---
+
+    def _depth_callback(self, msg):
+        try:
+            depth = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
+            # depth is uint8 [0,255] from navigation_node (MAVRL format)
+            # Resize to target size if needed
+            if depth.shape != (config.DEPTH_HEIGHT, config.DEPTH_WIDTH):
+                depth = cv2.resize(depth, (config.DEPTH_WIDTH, config.DEPTH_HEIGHT))
+            with self._lock:
+                self.depth_image = depth
+                self._obs_timestamp += 1
+        except Exception as e:
+            self.node.get_logger().warn(f"Depth callback error: {e}")
 
     def _stereo_callback(self, msg):
         if len(msg.data) >= 5:
             with self._lock:
                 self.stereo_distances = list(msg.data[:5])
-                self._obs_timestamp += 1
 
     def _odom_callback(self, msg):
         with self._lock:
@@ -160,21 +191,26 @@ class DroneEnv(gym.Env):
             self.current_y = msg.pose.pose.position.y
             self.current_z = msg.pose.pose.position.z
             self.odom_vx = msg.twist.twist.linear.x
-            self._obs_timestamp += 1
             self.odom_vy = msg.twist.twist.linear.y
             self.odom_vz = msg.twist.twist.linear.z
+            self.vel_world = np.array([self.odom_vx, self.odom_vy, self.odom_vz])
+
             q = msg.pose.pose.orientation
             sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
             cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
             self.current_roll = math.atan2(sinr_cosp, cosr_cosp)
+
             sinp = 2.0 * (q.w * q.y - q.z * q.x)
             if abs(sinp) >= 1.0:
                 self.current_pitch = math.copysign(math.pi / 2.0, sinp)
             else:
                 self.current_pitch = math.asin(sinp)
+
             siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
             cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
             self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+            self._obs_timestamp += 1
 
     def _collision_callback(self, msg):
         with self._lock:
@@ -182,91 +218,119 @@ class DroneEnv(gym.Env):
                 self.collision_detected = True
                 self.collision_type = "CONTACT"
                 self._collision_countdown = 20
-                self.node.get_logger().warn(
-                    f"[COLLISION] Contact sensor fired! States: {len(msg.states)}"
-                )
             else:
                 if self._collision_countdown > 0:
                     self._collision_countdown -= 1
                 else:
                     self.collision_detected = False
 
+    # --- Observation building ---
+
+    def _world2body(self, world_vel):
+        """Convert world-frame velocity to body-frame (RFU). Matching MAVRL."""
+        from scipy.spatial.transform import Rotation
+        quat = [0.0, 0.0, math.sin(self.current_yaw / 2.0), math.cos(self.current_yaw / 2.0)]
+        rot = Rotation.from_quat(quat)
+        # World RFU → FLU
+        world_flu = np.array([world_vel[1], -world_vel[0], world_vel[2]])
+        # Rotate to body FLU
+        body_flu = rot.inv().apply(world_flu)
+        # FLU → RFU
+        return np.array([body_flu[1], -body_flu[0], body_flu[2]])
+
     def _build_observation(self):
+        """Build MAVRL-style observation: Dict{image, state}."""
         with self._lock:
-            d = self.stereo_distances[:5]
-            x = self.current_x
-            y = self.current_y
-            z = self.current_z
+            pos = np.array([self.current_x, self.current_y, self.current_z])
+            vel = np.array([self.odom_vx, self.odom_vy, self.odom_vz])
             yaw = self.current_yaw
-            roll = self.current_roll
-            pitch = self.current_pitch
-            vx = self.odom_vx
-            vz = self.odom_vz
 
-        obs = np.array([
-            d[0] / config.OBS_STEREO_MAX,
-            d[1] / config.OBS_STEREO_MAX,
-            d[2] / config.OBS_STEREO_MAX,
-            d[3] / config.OBS_STEREO_MAX,
-            d[4] / config.OBS_STEREO_MAX,
-            x / config.OBS_POS_MAX,
-            y / config.OBS_POS_MAX,
-            z / config.OBS_Z_MAX,
-            math.sin(yaw),
-            math.cos(yaw),
-            np.clip(vx, -1.0, 1.0),
-            np.clip(vz, -1.0, 1.0),
-            roll / math.pi,
-            pitch / math.pi,
-        ], dtype=np.float32)
+        # Goal-oriented state (7-dim, MAVRL style)
+        delta_p = self.goal_point - pos
+        horizon_dist = math.sqrt(delta_p[0] ** 2 + delta_p[1] ** 2)
+        log_distance = math.log(horizon_dist + 1.0)
 
-        return obs
+        vel_body = self._world2body(vel)
+        horizon_vel = math.sqrt(vel_body[0] ** 2 + vel_body[1] ** 2)
+
+        theta = math.atan2(-delta_p[0], delta_p[1])
+        horizon_vel_dire = math.atan2(vel_body[1], vel_body[0])
+
+        state = np.array([
+            log_distance,
+            horizon_vel,
+            theta,
+            horizon_vel_dire,
+            delta_p[2],
+            vel_body[2],
+            yaw,
+        ], dtype=np.float64)
+
+        return {'image': self.depth_image, 'state': state}
+
+    # --- Action application ---
 
     def _apply_action(self, action):
-        """Scale normalized action [-1,1] to physical commands and publish."""
-        vx = np.interp(action[0], [-1.0, 1.0],
-                        [config.ACTION_VX_MIN, config.ACTION_VX_MAX])
-        vz = np.interp(action[1], [-1.0, 1.0],
-                        [config.ACTION_VZ_MIN, config.ACTION_VZ_MAX])
-        yaw = np.interp(action[2], [-1.0, 1.0],
-                         [config.ACTION_YAW_MIN, config.ACTION_YAW_MAX])
+        """Denormalize action and apply as body-frame acceleration.
+        Matching MAVRL: no velocity clipping."""
+        action_arr = np.array(action, dtype=np.float32)
+        cmd = action_arr * config.ACTION_STD + config.ACTION_MEAN
 
+        acc_body = cmd[:3]  # body-frame acceleration
+        yaw_rate = cmd[3]
+
+        # Integrate: vel_world += R(body→world) * acc_body * dt
+        # Matching MAVRL: self.vel_world = self.vel + acc_world * duration
+        acc_world = self._body2world(acc_body)
+        self.vel_world = self.vel_world + acc_world * config.DT
+
+        # Publish velocity command (no clipping, like MAVRL)
         msg = Twist()
-        msg.linear.x = float(vx)
-        msg.linear.z = float(vz)
-        msg.angular.z = float(yaw)
-
+        msg.linear.x = float(self.vel_world[0])
+        msg.linear.y = float(self.vel_world[1])
+        msg.linear.z = float(self.vel_world[2])
+        msg.angular.z = float(yaw_rate)
         self._cmd_vel_pub.publish(msg)
 
-        self._set_gazebo_z(float(vz))
+        # Z-axis via Gazebo service
+        self._set_gazebo_z(float(self.vel_world[2]))
 
-        self.last_vx_cmd = vx
-        self.last_vz_cmd = vz
-        self.last_yaw_cmd = yaw
+        self.last_vx_cmd = float(self.vel_world[0])
+        self.last_vz_cmd = float(self.vel_world[2])
+        self.last_yaw_cmd = float(yaw_rate)
+
+        # Save action for penalty computation (MAVRL-style)
+        self.prev_action = action_arr.copy()
+        self.prev_angular_vel = yaw_rate
+        self.prev_vz_input = float(cmd[2])
+
+    def _body2world(self, acc_body):
+        """Body-frame acceleration → world-frame (RFU). Matching MAVRL."""
+        from scipy.spatial.transform import Rotation
+        # Convert yaw to quaternion (like MAVRL)
+        quat = [0.0, 0.0, math.sin(self.current_yaw / 2.0), math.cos(self.current_yaw / 2.0)]
+        rot = Rotation.from_quat(quat)
+        # Body RFU → FLU
+        flu = np.array([acc_body[1], -acc_body[0], acc_body[2]])
+        # Rotate to world FLU
+        world_flu = rot.apply(flu)
+        # FLU → RFU
+        return np.array([-world_flu[1], world_flu[0], world_flu[2]])
 
     def _set_gazebo_z(self, vz):
-        """Set Z-axis via Gazebo service (async, with timeout)."""
-        if not rclpy.ok():
-            return
-        if not self._gz_set_state_client.wait_for_service(timeout_sec=0.1):
+        """Set Z-axis via Gazebo service with speed limiting."""
+        if not self._gz_set_state_client.service_is_ready():
             return
 
         with self._lock:
-            cx = self.current_x
-            cy = self.current_y
-            cz = self.current_z
+            cx, cy, cz = self.current_x, self.current_y, self.current_z
             yaw = self.current_yaw
-            bottom_dist = self.stereo_distances[4] if len(self.stereo_distances) >= 5 else 10.0
-            top_dist = self.stereo_distances[3] if len(self.stereo_distances) >= 5 else 10.0
 
-        # Don't teleport if too close to floor/ceiling (let physics handle it)
-        if bottom_dist < 0.3 and vz < 0:
-            return  # Too close to floor, don't go down
-        if top_dist < 0.3 and vz > 0:
-            return  # Too close to ceiling, don't go up
-
-        target_z = cz + vz * config.DT
-        target_z = max(0.5, min(config.DRONE_MAX_Z, target_z))
+        # Limit Z speed: max 0.3m per step (≈9m/s at 30Hz)
+        max_z_step = 0.3
+        z_step = np.clip(vz * config.DT, -max_z_step, max_z_step)
+        target_z = cz + z_step
+        target_z = max(config.DRONE_MIN_Z, min(config.DRONE_MAX_Z, target_z))
 
         req = SetEntityState.Request()
         req.state = EntityState()
@@ -274,259 +338,219 @@ class DroneEnv(gym.Env):
         req.state.pose.position.x = cx
         req.state.pose.position.y = cy
         req.state.pose.position.z = target_z
-        q = self._yaw_to_quaternion(yaw)
-        req.state.pose.orientation.x = q[0]
-        req.state.pose.orientation.y = q[1]
-        req.state.pose.orientation.z = q[2]
-        req.state.pose.orientation.w = q[3]
+        qz = math.sin(yaw / 2.0)
+        qw = math.cos(yaw / 2.0)
+        req.state.pose.orientation.x = 0.0
+        req.state.pose.orientation.y = 0.0
+        req.state.pose.orientation.z = float(qz)
+        req.state.pose.orientation.w = float(qw)
+        req.state.twist.linear.z = float(vz)
         req.state.reference_frame = "world"
 
-        future = self._gz_set_state_client.call_async(req)
         try:
-            future.result(timeout_sec=0.5)
+            future = self._gz_set_state_client.call_async(req)
+            rclpy.spin_until_future_complete(self.node, future, timeout_sec=0.1)
         except Exception:
             pass
 
-    def _yaw_to_quaternion(self, yaw):
-        return [0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)]
+    # --- Stuck detection ---
 
-    def _wait_for_odom(self, timeout=None):
-        """Wait until odometry reports drone at spawn position (drone exists)."""
-        if timeout is None:
-            timeout = 30.0
-        start = time.time()
-        while time.time() - start < timeout:
-            with self._lock:
-                if abs(self.current_z - config.DRONE_SPAWN_Z) < 0.1:
-                    return True
-            time.sleep(0.5)
-        raise TimeoutError(f"Drone odometry not received after {timeout}s")
-
-    def _wait_for_new_obs(self, timeout=None):
-        """Block until a new observation arrives or timeout."""
-        if timeout is None:
-            timeout = config.SIM_STEP_TIMEOUT
-        start_ts = self._obs_timestamp
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if self._obs_timestamp > start_ts:
-                return True
-            time.sleep(0.005)
-        return False
-
-    def _check_stuck(self, dist, yaw, vx):
-        """Check if drone is stuck: not moving forward for too long."""
+    def _check_stuck(self, vx):
+        """Check if drone is stuck."""
         with self._lock:
-            cx = self.current_x
-            cy = self.current_y
+            cx, cy = self.current_x, self.current_y
 
         self._pos_history.append((cx, cy))
 
-        # Check rotation
-        yaw_change = abs(yaw - self.prev_yaw)
-        if yaw_change > math.pi:
-            yaw_change = 2 * math.pi - yaw_change
-        is_rotating = yaw_change > 0.02
-
-        # Check forward movement
         is_moving_forward = vx > 0.1
 
-        # Stuck = not moving forward for >5 seconds (100 steps)
         if not is_moving_forward:
             self._near_wall_count += 1
         else:
             self._near_wall_count = max(0, self._near_wall_count - 5)
 
-        stuck = self._near_wall_count > 100  # 5 seconds
-        return stuck
+        # Stuck = not moving forward for >10 seconds (200 steps)
+        return self._near_wall_count > 200
+
+    # --- Step ---
 
     def step(self, action):
+        # Save previous action BEFORE applying new one (for reward penalties)
+        self._saved_prev_action = self.prev_action.copy()
+        self._saved_prev_angular_vel = self.prev_angular_vel
+        self._saved_prev_vz_input = self.prev_vz_input
+        
         self._apply_action(action)
         time.sleep(config.DT)
 
         if not self._wait_for_new_obs():
             self._gazebo_stale_steps += 1
-            if not rclpy.ok():
+            if not rclpy.ok() or self._gazebo_stale_steps >= 10:
                 self._gazebo_restart_needed = True
                 self._gazebo_stale_steps = 0
                 obs = self._build_observation()
                 self._step_count += 1
-                info = {"termination_reason": "gazebo_crash"}
-                return obs, config.R_COLLISION, True, False, info
-            if self._gazebo_stale_steps >= 10:
-                self.node.get_logger().error(
-                    "[WATCHDOG] Gazebo unresponsive for 10+ steps, forcing restart"
-                )
-                self._gazebo_restart_needed = True
-                self._gazebo_stale_steps = 0
-                obs = self._build_observation()
-                self._step_count += 1
-                info = {"termination_reason": "gazebo_stall"}
-                return obs, config.R_COLLISION, True, False, info
+                return obs, 0.0, True, False, {"termination_reason": "gazebo_crash"}
         else:
             self._gazebo_stale_steps = 0
 
         obs = self._build_observation()
         self._step_count += 1
-        self._last_step_timestamp = self._obs_timestamp
 
         with self._lock:
-            dist = self.stereo_distances[:5]
             collision = self.collision_detected
-            ctype = self.collision_type
-            cx = self.current_x
-            cy = self.current_y
-            cz = self.current_z
-            yaw = self.current_yaw
+            cx, cy, cz = self.current_x, self.current_y, self.current_z
             vx = self.odom_vx
-            vy = self.odom_vy
-            vz = self.odom_vz
 
-        stuck = self._check_stuck(dist, yaw, vx)
+        stuck = self._check_stuck(vx)
         elapsed = time.time() - self._episode_start_time if self._episode_start_time else 0.0
-
-        # Save current distances for dodge reward
-        prev_dist = self._prev_distances[:]
-        self._prev_distances = dist[:]
 
         info = {
             "termination_reason": None,
             "collision": collision,
-            "collision_type": ctype,
-            "stereo_distances": dist,
-            "x": cx,
-            "y": cy,
-            "z": cz,
-            "yaw": yaw,
+            "x": cx, "y": cy, "z": cz,
+            "yaw": self.current_yaw,
             "stuck": stuck,
             "elapsed": elapsed,
             "step": self._step_count,
         }
 
-        reward, terminated, info = compute_reward(
-            distances=dist,
-            current_x=cx,
-            current_y=cy,
-            current_z=cz,
-            prev_x=self.prev_x,
-            prev_y=self.prev_y,
-            odom_vx=vx,
-            odom_vy=vy,
-            odom_vz=vz,
-            yaw=yaw,
-            collision_detected=collision,
-            collision_type=ctype,
-            elapsed_time=elapsed,
-            entrance_heading=self.entrance_heading,
-            completed_lap=self.completed_lap,
+        # Compute reward
+        reward, terminated, info = self._compute_reward(
+            pos=np.array([cx, cy, cz]),
+            prev_pos=np.array([self.prev_x, self.prev_y]),
+            vel_world=self.vel_world.copy(),
+            yaw=self.current_yaw,
+            collision=collision,
             stuck=stuck,
+            elapsed=elapsed,
             info=info,
-            reward_overrides=self.curriculum.get_reward_coefficients(),
-            prev_yaw=self.prev_yaw,
-            prev_distances=prev_dist,
-            flight_history=list(self._flight_history),
-            current_path=self._current_flight_path,
         )
 
         with self._lock:
             if collision:
                 self.collision_detected = False
 
-        # Log collision events for debugging
-        if terminated and "collision" in info.get("termination_reason", ""):
-            self.node.get_logger().warn(
-                f"[COLLISION] Episode {self.episode_count} step {self._step_count}: "
-                f"{info['termination_reason']} | dists={[f'{d:.2f}' for d in dist]}"
-            )
-
         self.prev_x = cx
         self.prev_y = cy
-        self.prev_yaw = yaw
-
-        # Record flight path for novelty detection
-        self._current_flight_path.append((cx, cy, cz))
+        self.prev_yaw = self.current_yaw
 
         truncated = False
-
-        # Handle timeout as truncated (not terminated)
         if not terminated and elapsed > config.EPISODE_TIMEOUT_SEC:
             truncated = True
             info["termination_reason"] = "timeout"
 
         if terminated or truncated:
-            # Save flight path for novelty detection
-            if self._current_flight_path:
-                self._flight_history.append(self._current_flight_path[:])
+            success = info.get("termination_reason") == "completed_lap"
             reason = info.get("termination_reason", "")
-            # Success = survived long enough (timeout with >2000 steps) or completed lap
-            success = (reason == "timeout" and self._step_count > 2000) or (reason == "completed_lap")
-            self.curriculum.record_episode(
-                success=success,
-                length=self._step_count,
-                reward=reward,
-                termination_reason=reason,
+            self.node.get_logger().info(
+                f"[EP {self.episode_count}] {reason} | steps={self._step_count} | reward={reward:.2f}"
             )
 
         return obs, reward, terminated, truncated, info
+
+    # --- Reward ---
+
+    def _compute_reward(self, pos, prev_pos, vel_world, yaw, collision, stuck, elapsed, info):
+        terminated = False
+        reward = 0.0
+
+        # 1. Goal progress (matching MAVRL: distance_coeff × (-Δdistance))
+        dist_to_goal = np.linalg.norm(pos - self.goal_point)
+        prev_dist = np.linalg.norm(
+            np.array([prev_pos[0], prev_pos[1], pos[2]]) - self.goal_point
+        )
+        progress = prev_dist - dist_to_goal
+        reward += config.R_GOAL_COEFF * progress
+
+        # 2. MAVRL-style action penalties (smooth flight)
+        # Angular velocity penalty
+        reward += config.R_ANGULAR_PENALTY * abs(self._saved_prev_angular_vel)
+        
+        # Input change penalty (action smoothness)
+        action_delta = np.linalg.norm(self.prev_action - self._saved_prev_action)
+        reward += config.R_INPUT_PENALTY * action_delta
+        
+        # Yaw rate penalty
+        reward += config.R_YAW_PENALTY * abs(self._saved_prev_angular_vel)
+        
+        # Vertical input penalty
+        reward += config.R_VERTICAL_PENALTY * abs(self._saved_prev_vz_input)
+
+        # 3. Collision (terminal) — MAVRL: reset_if_collide=true, no penalty
+        if collision:
+            info["termination_reason"] = "collision"
+            terminated = True
+
+        # 4. Stuck (terminal)
+        if stuck:
+            reward += config.R_STUCK
+            info["termination_reason"] = "stuck"
+            terminated = True
+
+        # 8. Out of bounds (terminal)
+        out_of_bounds = (
+            pos[2] < config.DRONE_MIN_Z
+            or pos[2] > config.DRONE_MAX_Z
+            or abs(pos[0]) > config.BOUNDS_XY
+            or abs(pos[1]) > config.BOUNDS_XY
+        )
+        if out_of_bounds:
+            reward += config.R_OUT_OF_BOUNDS
+            info["termination_reason"] = "out_of_bounds"
+            terminated = True
+
+        # 9. Goal reached (terminal, success)
+        if dist_to_goal < config.GOAL_REACHED_THRESHOLD:
+            reward += config.R_COMPLETION
+            info["termination_reason"] = "completed_lap"
+            terminated = True
+
+        # 10. Timeout
+        if elapsed > config.EPISODE_TIMEOUT_SEC:
+            reward += config.R_TIMEOUT
+            info["termination_reason"] = "timeout"
+
+        return reward, terminated, info
+
+    # --- Reset ---
 
     def reset(self, seed=None, options=None):
         if seed is not None:
             super().reset(seed=seed)
 
         self._step_count = 0
-        self.completed_lap = False
-        self.stuck_start_time = None
-        self.entrance_heading = None
-        self.prev_x = 0.0
-        self.prev_y = 0.0
-        self.prev_yaw = 0.0
-        self._prev_distances = [10.0, 10.0, 10.0, 10.0, 10.0]
-        self._vx_sign_history = []
-        self._current_flight_path = []
-        self._pos_history.clear()
         self._near_wall_count = 0
+        self._pos_history.clear()
+        self.vel_world = np.array([0.0, 0.0, 0.0])
 
         with self._lock:
             self.collision_detected = False
             self.collision_type = "NONE"
             self._collision_countdown = 0
 
-        self.node.get_logger().info(
-            f"[RESET] Episode {self.episode_count} starting..."
-        )
+        self.node.get_logger().info(f"[RESET] Episode {self.episode_count} starting...")
 
-        cave_script = self.curriculum.get_cave_script()
-        stage_name = self.curriculum.get_current_stage()["name"]
-        self.node.get_logger().info(
-            f"[CURRICULUM] Stage: {stage_name}, Cave: {cave_script.name}"
-        )
+        # Determine cave script from curriculum
+        cave_script = self._get_cave_script()
 
-        # Try to reset with recovery on failure
+        # Reset or relaunch Gazebo
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                if self._gazebo_restart_needed:
+                if self._gazebo_restart_needed or self.episode_count == 0:
                     self._gazebo_restart_needed = False
                     self._gazebo_restart_count += 1
-                    self.node.get_logger().warn(
-                        f"[RECOVERY] Gazebo restart #{self._gazebo_restart_count}"
-                    )
                     if self._gazebo_restart_count > 5:
-                        raise RuntimeError(
-                            f"Gazebo crashed {self._gazebo_restart_count} times — aborting"
-                        )
+                        raise RuntimeError("Gazebo crashed too many times")
+                    import utils
                     utils.kill_gazebo()
-                    if self.gazebo_proc is not None:
-                        try:
-                            self.gazebo_proc.kill()
-                            self.gazebo_proc.wait(timeout=5)
-                        except Exception:
-                            pass
                     utils.generate_cave(cave_script=cave_script)
                     self.gazebo_proc = utils.launch_gazebo(headless=self.headless)
                     utils.wait_for_gazebo()
                     self._wait_for_odom(timeout=60.0)
-                elif self.episode_count == 0 or self.episode_count % config.CAVE_CHANGE_INTERVAL == 0:
+                elif self.episode_count % config.CAVE_CHANGE_INTERVAL == 0:
+                    import utils
                     if self.gazebo_proc is not None:
                         self.gazebo_proc.kill()
                         self.gazebo_proc.wait(timeout=5)
@@ -536,12 +560,10 @@ class DroneEnv(gym.Env):
                     utils.wait_for_gazebo()
                     self._wait_for_odom(timeout=60.0)
                 else:
+                    import utils
                     try:
                         utils.reset_drone(self.node)
                     except RuntimeError:
-                        self.node.get_logger().warn(
-                            "[RECOVERY] reset_drone failed, forcing full Gazebo restart"
-                        )
                         utils.kill_gazebo()
                         if self.gazebo_proc is not None:
                             try:
@@ -553,30 +575,27 @@ class DroneEnv(gym.Env):
                         self.gazebo_proc = utils.launch_gazebo(headless=self.headless)
                         utils.wait_for_gazebo()
                         self._wait_for_odom(timeout=60.0)
-
-                # If we get here, Gazebo is running
                 break
-
             except (TimeoutError, RuntimeError) as e:
-                self.node.get_logger().error(
-                    f"[RECOVERY] Reset attempt {attempt + 1} failed: {e}"
-                )
+                self.node.get_logger().error(f"Reset attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
-                    self.node.get_logger().warn(
-                        f"[RECOVERY] Retrying in 5 seconds..."
-                    )
+                    import utils
                     utils.kill_gazebo()
                     time.sleep(5.0)
                     self._gazebo_restart_needed = True
                 else:
-                    raise RuntimeError(
-                        f"Gazebo failed to restart after {max_retries} attempts"
-                    )
+                    raise
 
         self._wait_for_new_obs(timeout=15.0)
 
-        obs = self._build_observation()
+        # Set goal-point
+        self.goal_point = np.array([
+            config.CAVE_LENGTH * config.GOAL_DISTANCE_RATIO,
+            0.0,
+            config.GOAL_Z,
+        ])
 
+        # Set entrance heading
         with self._lock:
             self.entrance_heading = (
                 math.cos(self.current_yaw),
@@ -587,10 +606,36 @@ class DroneEnv(gym.Env):
 
         self.episode_count += 1
         self._episode_start_time = time.time()
-        self._last_step_timestamp = self._obs_timestamp
 
-        info = {}
-        return obs, info
+        return self._build_observation(), {}
+
+    def _get_cave_script(self):
+        """Get cave script path based on curriculum stage."""
+        # Simple: always use procedural cave for now
+        # TODO: integrate curriculum manager
+        return config.SCRIPTS_DIR / "procedural_cave.py"
+
+    # --- Helpers ---
+
+    def _wait_for_odom(self, timeout=30.0):
+        start = time.time()
+        while time.time() - start < timeout:
+            with self._lock:
+                if abs(self.current_z - config.DRONE_SPAWN_Z) < 0.5:
+                    return True
+            time.sleep(0.5)
+        raise TimeoutError(f"Drone odometry not received after {timeout}s")
+
+    def _wait_for_new_obs(self, timeout=None):
+        if timeout is None:
+            timeout = config.SIM_STEP_TIMEOUT
+        start_ts = self._obs_timestamp
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self._obs_timestamp > start_ts:
+                return True
+            time.sleep(0.005)
+        return False
 
     def close(self):
         self._spin_running = False
@@ -598,7 +643,3 @@ class DroneEnv(gym.Env):
             self._spin_thread.join(timeout=2.0)
         if self.node is not None:
             self.node.destroy_node()
-
-    def set_total_steps(self, steps):
-        """Update total training steps for curriculum tracking."""
-        self.curriculum.update_steps(steps)

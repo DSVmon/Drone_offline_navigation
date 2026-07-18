@@ -163,8 +163,10 @@ class ControlNode(Node):
         else:
             dt = (now - self.last_control_time).nanoseconds / 1e9
         
-        # Update target Z
-        self.target_z += vz * dt
+        # Update target Z with speed limiting (max 0.3m per step ≈ 9m/s)
+        max_z_step = 0.3
+        z_step = max(-max_z_step, min(max_z_step, vz * dt))
+        self.target_z += z_step
         self.target_z = max(0.1, min(3.4, self.target_z))
         
         req = SetEntityState.Request()
