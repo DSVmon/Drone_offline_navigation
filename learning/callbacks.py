@@ -1,8 +1,10 @@
 import csv
+import json
 import time
 from pathlib import Path
 from stable_baselines3.common.callbacks import BaseCallback
 import config
+from curriculum import CurriculumManager
 
 
 class ConsoleMonitorCallback(BaseCallback):
@@ -33,7 +35,6 @@ class ConsoleMonitorCallback(BaseCallback):
                     r = ep_info["r"]
                     l = int(ep_info["l"])
                     reason = info.get("termination_reason", "?")
-                    ep_num = len(self.locals["infos"])  # not reliable
 
                     self.episode_rewards.append(r)
                     self.episode_lengths.append(l)
@@ -109,3 +110,127 @@ class CSVEpisodeLogger(BaseCallback):
     def close(self):
         if self.file_handle is not None:
             self.file_handle.close()
+
+
+class CurriculumCallback(BaseCallback):
+    """Periodically checks curriculum stage and logs transitions."""
+
+    def __init__(self, check_interval=50_000, verbose=0):
+        super().__init__(verbose)
+        self.check_interval = check_interval
+        self.curriculum = None
+        self._base_env = None
+        self.last_check = 0
+
+    def _on_training_start(self):
+        env = self.training_env
+        while hasattr(env, "env"):
+            env = env.env
+        self._base_env = env
+        if hasattr(env, "curriculum"):
+            self.curriculum = env.curriculum
+        # Update total_steps from loaded checkpoint
+        if self._base_env and hasattr(self._base_env, "set_total_steps"):
+            self._base_env.set_total_steps(self.num_timesteps)
+
+    def _on_step(self):
+        if self.curriculum is None:
+            return True
+
+        # Update total_steps every step
+        if self._base_env and hasattr(self._base_env, "set_total_steps"):
+            self._base_env.set_total_steps(self.num_timesteps)
+
+        if self.num_timesteps - self.last_check < self.check_interval:
+            return True
+
+        self.last_check = self.num_timesteps
+
+        status = self.curriculum.get_status()
+        if self.verbose >= 1:
+            print(self.curriculum.format_report())
+
+        if self.curriculum.should_advance():
+            result = self.curriculum.advance_stage()
+            print(f"\n{'='*60}")
+            print(f"[CURRICULUM] {result}")
+            print(f"{'='*60}\n")
+
+        elif self.curriculum.should_regress():
+            result = self.curriculum.regress_stage()
+            print(f"\n{'='*60}")
+            print(f"[CURRICULUM] {result}")
+            print(f"{'='*60}\n")
+
+        return True
+
+
+class ControlFileCallback(BaseCallback):
+    """Reads training_control.json and applies parameter adjustments."""
+
+    def __init__(self, check_interval=60_000, verbose=0):
+        super().__init__(verbose)
+        self.check_interval = check_interval
+        self.last_check = 0
+        self.control_file = config.LEARNING_DIR / "training_control.json"
+
+    def _on_step(self):
+        if self.num_timesteps - self.last_check < self.check_interval:
+            return True
+
+        self.last_check = self.num_timesteps
+
+        if not self.control_file.exists():
+            return True
+
+        try:
+            with open(self.control_file) as f:
+                control = json.load(f)
+
+            action = control.get("action")
+
+            if action == "pause":
+                print("\n[CONTROL] Pause signal received. Training paused.")
+                print("[CONTROL] Delete training_control.json to resume.")
+                while self.control_file.exists():
+                    time.sleep(1.0)
+                print("[CONTROL] Resumed.\n")
+
+            elif action == "adjust":
+                adjustments = control.get("adjustments", {})
+                reasons = control.get("reasons", [])
+                print(f"\n[CONTROL] Applying adjustments:")
+                for param, value in adjustments.items():
+                    print(f"  - {param}: {value}")
+                for reason in reasons:
+                    print(f"  Reason: {reason}")
+
+                # Apply learning rate
+                if "learning_rate" in adjustments:
+                    new_lr = float(adjustments["learning_rate"])
+                    self.model.learning_rate = new_lr
+                    print(f"  [CONTROL] Learning rate set to {new_lr}")
+
+                # Apply reward coefficient changes to config
+                reward_params = {
+                    "R_PROGRESS_COEFF": "progress_coeff",
+                    "R_PROXIMITY_COEFF": "proximity_coeff",
+                    "R_PROXIMITY_THRESHOLD": "proximity_threshold",
+                    "R_STUCK": "stuck_penalty",
+                    "R_SPEED_COEFF": "speed_coeff",
+                    "R_SURVIVE": "survive_bonus",
+                }
+                for config_key, adj_key in reward_params.items():
+                    if adj_key in adjustments:
+                        new_val = float(adjustments[adj_key])
+                        setattr(config, config_key, new_val)
+                        print(f"  [CONTROL] {config_key} set to {new_val}")
+
+                # Remove control file after applying
+                self.control_file.unlink()
+                print("[CONTROL] Adjustments applied.\n")
+
+        except Exception as e:
+            print(f"[CONTROL] Error reading control file: {e}")
+
+        return True

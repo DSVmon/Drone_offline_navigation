@@ -18,12 +18,13 @@ from gazebo_msgs.srv import SetEntityState
 import config
 from reward import compute_reward
 import utils
+from curriculum import CurriculumManager
 
 
 class DroneEnv(gym.Env):
     """Gymnasium environment wrapping ROS 2 / Gazebo for drone RL training."""
 
-    def __init__(self, headless=None, seed=None):
+    def __init__(self, headless=None, seed=None, node_name="drone_env_node"):
         super().__init__()
 
         self.headless = headless if headless is not None else config.HEADLESS
@@ -31,26 +32,20 @@ class DroneEnv(gym.Env):
         self.gazebo_proc = None
 
         # --- Observation space ---
-        # 20-dim: prev_stereo[5], stereo[5], x, y, z, sin(yaw), cos(yaw), vx, vz, roll/pi, pitch/pi
+        # 14-dim: stereo[5], x, y, z, sin(yaw), cos(yaw), vx, vz, roll/pi, pitch/pi
         obs_low = np.array([
-            0.0, 0.0, 0.0, 0.0, 0.0,
             0.0, 0.0, 0.0, 0.0, 0.0,
             -1.0, -1.0, 0.0,
             -1.0, -1.0,
-            -1.0,
-            -1.0,
-            -1.0,
-            -1.0,
+            -1.0, -1.0,
+            -1.0, -1.0,
         ], dtype=np.float32)
         obs_high = np.array([
             1.5, 1.5, 1.5, 1.5, 1.5,
-            1.5, 1.5, 1.5, 1.5, 1.5,
             1.0, 1.0, 1.0,
             1.0, 1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
+            1.0, 1.0,
+            1.0, 1.0,
         ], dtype=np.float32)
         self.observation_space = spaces.Box(obs_low, obs_high, dtype=np.float32)
 
@@ -75,9 +70,11 @@ class DroneEnv(gym.Env):
         self.odom_vz = 0.0
         self.collision_detected = False
         self.collision_type = "NONE"
+        self._collision_countdown = 0
 
         self.prev_x = 0.0
         self.prev_y = 0.0
+        self.prev_yaw = 0.0
         self.entrance_heading = None
         self.elapsed_time = 0.0
         self.stuck_start_time = None
@@ -89,18 +86,26 @@ class DroneEnv(gym.Env):
         self._episode_start_time = None
 
         self._pos_history = deque(maxlen=100)
+        self._vx_sign_history = []
+        self._prev_distances = [10.0, 10.0, 10.0, 10.0, 10.0]
+        self._flight_history = deque(maxlen=5)  # last 5 flight paths
+        self._current_flight_path = []
         self._near_wall_count = 0
-
-        self._prev_stereo_distances = [10.0, 10.0, 10.0, 10.0, 10.0]
+        self._gazebo_restart_needed = False
+        self._gazebo_restart_count = 0
+        self._gazebo_stale_steps = 0
 
         self.last_vx_cmd = 0.0
         self.last_vz_cmd = 0.0
         self.last_yaw_cmd = 0.0
 
+        # Curriculum
+        self.curriculum = CurriculumManager()
+
         # ROS 2
         if not rclpy.ok():
             rclpy.init()
-        self.node = Node("drone_env_node")
+        self.node = Node(node_name)
 
         self._sub_stereo = self.node.create_subscription(
             Float32MultiArray,
@@ -138,7 +143,10 @@ class DroneEnv(gym.Env):
     def _spin(self):
         """Background thread spinning ROS 2."""
         while self._spin_running and rclpy.ok():
-            rclpy.spin_once(self.node, timeout_sec=0.01)
+            try:
+                rclpy.spin_once(self.node, timeout_sec=0.01)
+            except Exception:
+                pass  # Ignore threading errors
 
     def _stereo_callback(self, msg):
         if len(msg.data) >= 5:
@@ -171,15 +179,20 @@ class DroneEnv(gym.Env):
     def _collision_callback(self, msg):
         with self._lock:
             if len(msg.states) > 0:
-                if not self.collision_detected:
-                    self.collision_detected = True
-                    self.collision_type = "CONTACT"
+                self.collision_detected = True
+                self.collision_type = "CONTACT"
+                self._collision_countdown = 20
+                self.node.get_logger().warn(
+                    f"[COLLISION] Contact sensor fired! States: {len(msg.states)}"
+                )
             else:
-                self.collision_detected = False
+                if self._collision_countdown > 0:
+                    self._collision_countdown -= 1
+                else:
+                    self.collision_detected = False
 
     def _build_observation(self):
         with self._lock:
-            p = self._prev_stereo_distances[:5]
             d = self.stereo_distances[:5]
             x = self.current_x
             y = self.current_y
@@ -191,11 +204,6 @@ class DroneEnv(gym.Env):
             vz = self.odom_vz
 
         obs = np.array([
-            p[0] / config.OBS_STEREO_MAX,
-            p[1] / config.OBS_STEREO_MAX,
-            p[2] / config.OBS_STEREO_MAX,
-            p[3] / config.OBS_STEREO_MAX,
-            p[4] / config.OBS_STEREO_MAX,
             d[0] / config.OBS_STEREO_MAX,
             d[1] / config.OBS_STEREO_MAX,
             d[2] / config.OBS_STEREO_MAX,
@@ -237,7 +245,9 @@ class DroneEnv(gym.Env):
         self.last_yaw_cmd = yaw
 
     def _set_gazebo_z(self, vz):
-        """Set Z-axis via Gazebo service (planar_move workaround)."""
+        """Set Z-axis via Gazebo service (async, with timeout)."""
+        if not rclpy.ok():
+            return
         if not self._gz_set_state_client.wait_for_service(timeout_sec=0.1):
             return
 
@@ -246,11 +256,17 @@ class DroneEnv(gym.Env):
             cy = self.current_y
             cz = self.current_z
             yaw = self.current_yaw
+            bottom_dist = self.stereo_distances[4] if len(self.stereo_distances) >= 5 else 10.0
+            top_dist = self.stereo_distances[3] if len(self.stereo_distances) >= 5 else 10.0
 
-        descent_factor = max(0.0, 1.0 - abs(min(vz, 0.0)) / 0.3)
-        hover_correction = (config.DRONE_SPAWN_Z - cz) * 0.3 * descent_factor
-        target_z = cz + vz * config.DT + hover_correction
-        target_z = max(config.DRONE_MIN_Z, min(config.DRONE_MAX_Z, target_z))
+        # Don't teleport if too close to floor/ceiling (let physics handle it)
+        if bottom_dist < 0.3 and vz < 0:
+            return  # Too close to floor, don't go down
+        if top_dist < 0.3 and vz > 0:
+            return  # Too close to ceiling, don't go up
+
+        target_z = cz + vz * config.DT
+        target_z = max(0.5, min(config.DRONE_MAX_Z, target_z))
 
         req = SetEntityState.Request()
         req.state = EntityState()
@@ -265,8 +281,9 @@ class DroneEnv(gym.Env):
         req.state.pose.orientation.w = q[3]
         req.state.reference_frame = "world"
 
+        future = self._gz_set_state_client.call_async(req)
         try:
-            self._gz_set_state_client.call(req)
+            future.result(timeout_sec=0.5)
         except Exception:
             pass
 
@@ -297,40 +314,57 @@ class DroneEnv(gym.Env):
             time.sleep(0.005)
         return False
 
-    def _check_stuck(self, dist):
-        """Check if drone is stuck using position history + wall proximity."""
+    def _check_stuck(self, dist, yaw, vx):
+        """Check if drone is stuck: not moving forward for too long."""
         with self._lock:
             cx = self.current_x
             cy = self.current_y
 
         self._pos_history.append((cx, cy))
-        min_wall = min(dist)
 
-        # Wall-proximity stuck: drone against a wall for >2s (40 steps)
-        if min_wall < 0.35:
+        # Check rotation
+        yaw_change = abs(yaw - self.prev_yaw)
+        if yaw_change > math.pi:
+            yaw_change = 2 * math.pi - yaw_change
+        is_rotating = yaw_change > 0.02
+
+        # Check forward movement
+        is_moving_forward = vx > 0.1
+
+        # Stuck = not moving forward for >5 seconds (100 steps)
+        if not is_moving_forward:
             self._near_wall_count += 1
         else:
-            self._near_wall_count = max(0, self._near_wall_count - 2)
-        near_wall_stuck = self._near_wall_count > 40
+            self._near_wall_count = max(0, self._near_wall_count - 5)
 
-        # Position-progress stuck: less than 0.15m traveled in last 100 steps
-        pos_stuck = False
-        if len(self._pos_history) == self._pos_history.maxlen:
-            first_x, first_y = self._pos_history[0]
-            last_x, last_y = self._pos_history[-1]
-            dx = last_x - first_x
-            dy = last_y - first_y
-            if math.sqrt(dx*dx + dy*dy) < 0.15:
-                pos_stuck = True
-
-        return near_wall_stuck or pos_stuck
+        stuck = self._near_wall_count > 100  # 5 seconds
+        return stuck
 
     def step(self, action):
-        prev_dist = self._prev_stereo_distances
-
         self._apply_action(action)
         time.sleep(config.DT)
-        self._wait_for_new_obs()
+
+        if not self._wait_for_new_obs():
+            self._gazebo_stale_steps += 1
+            if not rclpy.ok():
+                self._gazebo_restart_needed = True
+                self._gazebo_stale_steps = 0
+                obs = self._build_observation()
+                self._step_count += 1
+                info = {"termination_reason": "gazebo_crash"}
+                return obs, config.R_COLLISION, True, False, info
+            if self._gazebo_stale_steps >= 10:
+                self.node.get_logger().error(
+                    "[WATCHDOG] Gazebo unresponsive for 10+ steps, forcing restart"
+                )
+                self._gazebo_restart_needed = True
+                self._gazebo_stale_steps = 0
+                obs = self._build_observation()
+                self._step_count += 1
+                info = {"termination_reason": "gazebo_stall"}
+                return obs, config.R_COLLISION, True, False, info
+        else:
+            self._gazebo_stale_steps = 0
 
         obs = self._build_observation()
         self._step_count += 1
@@ -348,8 +382,12 @@ class DroneEnv(gym.Env):
             vy = self.odom_vy
             vz = self.odom_vz
 
-        stuck = self._check_stuck(dist)
+        stuck = self._check_stuck(dist, yaw, vx)
         elapsed = time.time() - self._episode_start_time if self._episode_start_time else 0.0
+
+        # Save current distances for dodge reward
+        prev_dist = self._prev_distances[:]
+        self._prev_distances = dist[:]
 
         info = {
             "termination_reason": None,
@@ -367,7 +405,6 @@ class DroneEnv(gym.Env):
 
         reward, terminated, info = compute_reward(
             distances=dist,
-            prev_distances=prev_dist,
             current_x=cx,
             current_y=cy,
             current_z=cz,
@@ -384,17 +421,51 @@ class DroneEnv(gym.Env):
             completed_lap=self.completed_lap,
             stuck=stuck,
             info=info,
+            reward_overrides=self.curriculum.get_reward_coefficients(),
+            prev_yaw=self.prev_yaw,
+            prev_distances=prev_dist,
+            flight_history=list(self._flight_history),
+            current_path=self._current_flight_path,
         )
 
         with self._lock:
             if collision:
                 self.collision_detected = False
 
+        # Log collision events for debugging
+        if terminated and "collision" in info.get("termination_reason", ""):
+            self.node.get_logger().warn(
+                f"[COLLISION] Episode {self.episode_count} step {self._step_count}: "
+                f"{info['termination_reason']} | dists={[f'{d:.2f}' for d in dist]}"
+            )
+
         self.prev_x = cx
         self.prev_y = cy
-        self._prev_stereo_distances = dist
+        self.prev_yaw = yaw
+
+        # Record flight path for novelty detection
+        self._current_flight_path.append((cx, cy, cz))
 
         truncated = False
+
+        # Handle timeout as truncated (not terminated)
+        if not terminated and elapsed > config.EPISODE_TIMEOUT_SEC:
+            truncated = True
+            info["termination_reason"] = "timeout"
+
+        if terminated or truncated:
+            # Save flight path for novelty detection
+            if self._current_flight_path:
+                self._flight_history.append(self._current_flight_path[:])
+            reason = info.get("termination_reason", "")
+            # Success = survived long enough (timeout with >2000 steps) or completed lap
+            success = (reason == "timeout" and self._step_count > 2000) or (reason == "completed_lap")
+            self.curriculum.record_episode(
+                success=success,
+                length=self._step_count,
+                reward=reward,
+                termination_reason=reason,
+            )
 
         return obs, reward, terminated, truncated, info
 
@@ -408,28 +479,99 @@ class DroneEnv(gym.Env):
         self.entrance_heading = None
         self.prev_x = 0.0
         self.prev_y = 0.0
+        self.prev_yaw = 0.0
+        self._prev_distances = [10.0, 10.0, 10.0, 10.0, 10.0]
+        self._vx_sign_history = []
+        self._current_flight_path = []
         self._pos_history.clear()
         self._near_wall_count = 0
 
         with self._lock:
             self.collision_detected = False
             self.collision_type = "NONE"
+            self._collision_countdown = 0
 
         self.node.get_logger().info(
             f"[RESET] Episode {self.episode_count} starting..."
         )
 
-        if self.episode_count == 0 or self.episode_count % config.CAVE_CHANGE_INTERVAL == 0:
-            if self.gazebo_proc is not None:
-                self.gazebo_proc.kill()
-                self.gazebo_proc.wait(timeout=5)
-            utils.kill_gazebo()
-            utils.generate_cave()
-            self.gazebo_proc = utils.launch_gazebo(headless=self.headless)
-            utils.wait_for_gazebo()
-            self._wait_for_odom(timeout=45.0)
-        else:
-            utils.reset_drone(self.node)
+        cave_script = self.curriculum.get_cave_script()
+        stage_name = self.curriculum.get_current_stage()["name"]
+        self.node.get_logger().info(
+            f"[CURRICULUM] Stage: {stage_name}, Cave: {cave_script.name}"
+        )
+
+        # Try to reset with recovery on failure
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if self._gazebo_restart_needed:
+                    self._gazebo_restart_needed = False
+                    self._gazebo_restart_count += 1
+                    self.node.get_logger().warn(
+                        f"[RECOVERY] Gazebo restart #{self._gazebo_restart_count}"
+                    )
+                    if self._gazebo_restart_count > 5:
+                        raise RuntimeError(
+                            f"Gazebo crashed {self._gazebo_restart_count} times — aborting"
+                        )
+                    utils.kill_gazebo()
+                    if self.gazebo_proc is not None:
+                        try:
+                            self.gazebo_proc.kill()
+                            self.gazebo_proc.wait(timeout=5)
+                        except Exception:
+                            pass
+                    utils.generate_cave(cave_script=cave_script)
+                    self.gazebo_proc = utils.launch_gazebo(headless=self.headless)
+                    utils.wait_for_gazebo()
+                    self._wait_for_odom(timeout=60.0)
+                elif self.episode_count == 0 or self.episode_count % config.CAVE_CHANGE_INTERVAL == 0:
+                    if self.gazebo_proc is not None:
+                        self.gazebo_proc.kill()
+                        self.gazebo_proc.wait(timeout=5)
+                    utils.kill_gazebo()
+                    utils.generate_cave(cave_script=cave_script)
+                    self.gazebo_proc = utils.launch_gazebo(headless=self.headless)
+                    utils.wait_for_gazebo()
+                    self._wait_for_odom(timeout=60.0)
+                else:
+                    try:
+                        utils.reset_drone(self.node)
+                    except RuntimeError:
+                        self.node.get_logger().warn(
+                            "[RECOVERY] reset_drone failed, forcing full Gazebo restart"
+                        )
+                        utils.kill_gazebo()
+                        if self.gazebo_proc is not None:
+                            try:
+                                self.gazebo_proc.kill()
+                                self.gazebo_proc.wait(timeout=5)
+                            except Exception:
+                                pass
+                        utils.generate_cave(cave_script=cave_script)
+                        self.gazebo_proc = utils.launch_gazebo(headless=self.headless)
+                        utils.wait_for_gazebo()
+                        self._wait_for_odom(timeout=60.0)
+
+                # If we get here, Gazebo is running
+                break
+
+            except (TimeoutError, RuntimeError) as e:
+                self.node.get_logger().error(
+                    f"[RECOVERY] Reset attempt {attempt + 1} failed: {e}"
+                )
+                if attempt < max_retries - 1:
+                    self.node.get_logger().warn(
+                        f"[RECOVERY] Retrying in 5 seconds..."
+                    )
+                    utils.kill_gazebo()
+                    time.sleep(5.0)
+                    self._gazebo_restart_needed = True
+                else:
+                    raise RuntimeError(
+                        f"Gazebo failed to restart after {max_retries} attempts"
+                    )
 
         self._wait_for_new_obs(timeout=15.0)
 
@@ -442,7 +584,6 @@ class DroneEnv(gym.Env):
             )
             self.prev_x = self.current_x
             self.prev_y = self.current_y
-            self._prev_stereo_distances = self.stereo_distances[:5].copy()
 
         self.episode_count += 1
         self._episode_start_time = time.time()
@@ -457,3 +598,7 @@ class DroneEnv(gym.Env):
             self._spin_thread.join(timeout=2.0)
         if self.node is not None:
             self.node.destroy_node()
+
+    def set_total_steps(self, steps):
+        """Update total training steps for curriculum tracking."""
+        self.curriculum.update_steps(steps)

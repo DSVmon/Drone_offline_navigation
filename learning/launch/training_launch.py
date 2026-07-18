@@ -16,7 +16,7 @@ Usage:
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, ExecuteProcess
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -27,30 +27,34 @@ def generate_launch_description():
     pkg_gazebo_ros = get_package_share_directory("gazebo_ros")
     pkg_drone_simulation = get_package_share_directory("drone_simulation")
 
-    world_path = os.path.join(pkg_drone_simulation, "worlds", "cave.world")
+    default_world = os.path.join(pkg_drone_simulation, "worlds", "cave.world")
     xacro_file = os.path.join(
         pkg_drone_simulation, "urdf", "rescue_drone.urdf.xacro"
     )
+    spawn_script = os.path.join("/opt/ros/humble/lib/gazebo_ros", "spawn_entity.py")
 
-    # Launch arguments
     gui_arg = DeclareLaunchArgument(
         "gui",
         default_value="false",
         description="Run Gazebo with GUI (true) or headless (false)",
     )
 
-    # 1. Gazebo
+    world_arg = DeclareLaunchArgument(
+        "world",
+        default_value=default_world,
+        description="Path to Gazebo world file",
+    )
+
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_gazebo_ros, "launch", "gazebo.launch.py")
         ),
         launch_arguments={
-            "world": world_path,
+            "world": LaunchConfiguration("world"),
             "gui": LaunchConfiguration("gui"),
         }.items(),
     )
 
-    # 2. Robot State Publisher (processes xacro)
     robot_description_config = xacro.process_file(xacro_file)
     robot_description = {"robot_description": robot_description_config.toxml()}
 
@@ -61,16 +65,13 @@ def generate_launch_description():
         parameters=[robot_description, {"use_sim_time": True}],
     )
 
-    # 3. Spawn Drone
-    spawn_entity = Node(
-        package="gazebo_ros",
-        executable="spawn_entity.py",
-        arguments=["-topic", "robot_description",
-                   "-entity", "rescue_drone", "-z", "1.0"],
+    spawn_entity = ExecuteProcess(
+        cmd=["/usr/bin/python3", spawn_script,
+             "-topic", "robot_description",
+             "-entity", "rescue_drone", "-z", "1.0"],
         output="screen",
     )
 
-    # 4. Navigation Node (headless: no OpenCV windows)
     navigation_node = Node(
         package="drone_navigation",
         executable="navigation_node",
@@ -80,7 +81,6 @@ def generate_launch_description():
         additional_env={"DISPLAY": ""},
     )
 
-    # 5. Perception Node
     perception_node = Node(
         package="drone_perception",
         executable="perception_node",
@@ -91,6 +91,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         gui_arg,
+        world_arg,
         gazebo,
         robot_state_publisher,
         spawn_entity,

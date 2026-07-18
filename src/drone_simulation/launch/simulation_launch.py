@@ -1,29 +1,31 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, ExecuteProcess
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch.actions import ExecuteProcess
 
 def generate_launch_description():
     pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
     pkg_drone_simulation = get_package_share_directory('drone_simulation')
     
     world_path = os.path.join(pkg_drone_simulation, 'worlds', 'cave.world')
-    # Find scripts directory relative to the package share directory
-    # share/drone_simulation/launch/simulation_launch.py -> go up 4 levels to workspace root
     workspace_root = os.path.abspath(os.path.join(pkg_drone_simulation, '..', '..', '..', '..'))
-    script_path = os.path.join(workspace_root, 'scripts', 'procedural_cave.py')
+    scripts_dir = os.path.join(workspace_root, 'scripts')
 
-    # Fallback for development (if running from src)
-    if not os.path.exists(script_path):
-        script_path = os.path.join(os.getcwd(), 'scripts', 'procedural_cave.py')
+    cave_script_arg = DeclareLaunchArgument(
+        'cave_script',
+        default_value='procedural_cave.py',
+        description='Cave generator script name'
+    )
 
-    # 0. Generate procedural cave
+    cave_script = LaunchConfiguration('cave_script')
+
     generate_cave = ExecuteProcess(
-        cmd=['python3', script_path, world_path],
+        cmd=['bash', '-c', 
+             'python3 ' + scripts_dir + '/$CAVE_SCRIPT ' + world_path],
+        additional_env={'CAVE_SCRIPT': cave_script},
         output='screen'
     )
 
@@ -80,6 +82,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        cave_script_arg,
         generate_cave,
         gazebo,
         spawn_drone,

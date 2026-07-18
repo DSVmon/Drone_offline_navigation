@@ -5,6 +5,7 @@ Main training script: Behavior Cloning → PPO fine-tuning.
 Usage:
     python3 learning/train.py                       # BC → PPO fresh
     python3 learning/train.py --resume <checkpoint>  # Resume PPO from checkpoint
+    python3 learning/train.py --no-bc                # PPO from scratch
 """
 
 import argparse
@@ -16,7 +17,12 @@ import torch
 import config
 from drone_env import DroneEnv
 from bc_model import train_bc, load_bc_into_ppo
-from callbacks import ConsoleMonitorCallback, CSVEpisodeLogger
+from callbacks import ConsoleMonitorCallback, CSVEpisodeLogger, CurriculumCallback, ControlFileCallback
+
+
+def make_env(headless=True, node_name="drone_env_node"):
+    """Create DroneEnv instance."""
+    return DroneEnv(headless=headless, node_name=node_name)
 
 
 def main():
@@ -54,7 +60,7 @@ def main():
         if not npz_files:
             print("[TRAIN] No expert data found. Run collect_expert.py first!")
             print("[TRAIN] Example:")
-            print("  Terminal 1: ./run_drone.sh")
+            print("  Terminal 1: ./run_drone.sh straight_cave.py")
             print("  Terminal 2: python3 learning/collect_expert.py")
             print("[TRAIN] After collection, re-run this script.")
             sys.exit(1)
@@ -62,7 +68,7 @@ def main():
         print("=" * 60)
         print("[TRAIN] Phase 1: Behavior Cloning (BC warm-start)")
         print("=" * 60)
-        bc_model = train_bc()
+        bc_model = train_bc(obs_dim=14)
 
         print("=" * 60)
         print("[TRAIN] Creating PPO model with BC warm-start...")
@@ -140,11 +146,14 @@ def main():
     print(f"        TensorBoard: {config.LOG_DIR}")
     print("=" * 60)
 
-    from stable_baselines3.common.callbacks import CheckpointCallback
+    from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 
     checkpoint_dir = Path(config.CHECKPOINT_DIR)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Create eval environment with different node name
+    eval_env = make_env(headless=args.headless, node_name="drone_env_eval")
 
     callbacks = [
         CheckpointCallback(
@@ -154,6 +163,16 @@ def main():
         ),
         ConsoleMonitorCallback(),
         CSVEpisodeLogger(),
+        CurriculumCallback(),
+        ControlFileCallback(),
+        EvalCallback(
+            eval_env,
+            best_model_save_path=str(checkpoint_dir / "best_model"),
+            log_path=str(config.LOG_DIR / "eval"),
+            eval_freq=20_000,
+            n_eval_episodes=5,
+            deterministic=True,
+        ),
     ]
 
     try:
@@ -172,6 +191,7 @@ def main():
     print(f"[TRAIN] Final model saved to {final_path}")
 
     env.close()
+    eval_env.close()
 
 
 if __name__ == "__main__":

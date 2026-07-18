@@ -2,8 +2,9 @@
 """
 Collect expert demonstration data from the running simulation.
 
-Run this alongside the existing simulation (ros2 launch drone_simulation simulation_launch.py).
-It subscribes to sensor topics and /cmd_vel, recording (observation, action) pairs.
+Run this alongside the existing simulation with straight cave:
+    Terminal 1: ./run_drone.sh straight_cave.py
+    Terminal 2: python3 learning/collect_expert.py
 
 Usage:
     python3 learning/collect_expert.py
@@ -85,6 +86,7 @@ class ExpertCollector(Node):
         self.current_y = msg.pose.pose.position.y
         self.current_z = msg.pose.pose.position.z
         self.odom_vx = msg.twist.twist.linear.x
+        self.odom_vz = msg.twist.twist.linear.z
         q = msg.pose.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.y * q.x)
         cosy_cosp = 1.0 - 2.0 * (q.x * q.x + q.z * q.z)
@@ -121,6 +123,7 @@ class ExpertCollector(Node):
             math.sin(self.current_yaw),
             math.cos(self.current_yaw),
             np.clip(self.odom_vx, -1.0, 1.0),
+            np.clip(self.odom_vz, -1.0, 1.0),
             self.current_roll / math.pi,
             self.current_pitch / math.pi,
         ], dtype=np.float32)
@@ -164,6 +167,13 @@ class ExpertCollector(Node):
 
 
 def main(args=None):
+    print("=" * 60)
+    print("[EXPERT] Expert Data Collection")
+    print("=" * 60)
+    print("[EXPERT] Make sure simulation is running with straight cave:")
+    print("  Terminal 1: ./run_drone.sh straight_cave.py")
+    print("=" * 60)
+
     rclpy.init(args=args)
     node = ExpertCollector()
 

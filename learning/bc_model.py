@@ -17,7 +17,7 @@ class BCNet(nn.Module):
         prev_size = obs_dim
         for h in hidden_sizes:
             layers.append(nn.Linear(prev_size, h))
-            layers.append(nn.Tanh())
+            layers.append(nn.ReLU())
             prev_size = h
         layers.append(nn.Linear(prev_size, act_dim))
 
@@ -27,25 +27,59 @@ class BCNet(nn.Module):
         return self.network(obs)
 
 
-def load_expert_data(expert_dir=None):
-    """Load all expert .npz files from the expert data directory."""
+def load_expert_data(expert_dir=None, target_obs_dim=None):
+    """Load all expert .npz files from the expert data directory.
+    
+    Args:
+        expert_dir: Directory containing .npz files
+        target_obs_dim: If specified, only load data with this observation dimension.
+                       If None, use the most common dimension.
+    """
     if expert_dir is None:
         expert_dir = config.EXPERT_DIR
 
     expert_dir = Path(expert_dir)
-    all_obs = []
-    all_acts = []
-
-    for npz_file in sorted(expert_dir.glob("*.npz")):
-        data = np.load(npz_file)
-        all_obs.append(data["observations"])
-        all_acts.append(data["actions"])
-
-    if not all_obs:
+    all_npz = sorted(expert_dir.glob("*.npz"))
+    if not all_npz:
         raise FileNotFoundError(
             f"No expert data found in {expert_dir}. "
             "Run collect_expert.py first."
         )
+
+    # Group files by observation dimension
+    dim_to_files = {}
+    for npz_file in all_npz:
+        with np.load(npz_file) as data:
+            d = data["observations"].shape[1]
+            dim_to_files.setdefault(d, []).append(npz_file)
+    
+    # Select target dimension
+    if target_obs_dim is not None:
+        if target_obs_dim in dim_to_files:
+            target_dim = target_obs_dim
+        else:
+            # Find closest dimension
+            available = sorted(dim_to_files.keys())
+            target_dim = min(available, key=lambda x: abs(x - target_obs_dim))
+            print(f"[BC] Target dim {target_obs_dim} not found, using closest: {target_dim}")
+    else:
+        # Use the most common dimension
+        dim_counts = {d: len(files) for d, files in dim_to_files.items()}
+        target_dim = max(dim_counts, key=dim_counts.get)
+    
+    matching = dim_to_files[target_dim]
+    skipped = len(all_npz) - len(matching)
+    if skipped:
+        print(f"[BC] Skipped {skipped} file(s) with obsolete obs dims "
+              f"{[k for k in sorted(dim_to_files) if k != target_dim]}, "
+              f"using {len(matching)} files with {target_dim}D observations")
+
+    all_obs = []
+    all_acts = []
+    for npz_file in matching:
+        data = np.load(npz_file)
+        all_obs.append(data["observations"])
+        all_acts.append(data["actions"])
 
     observations = np.concatenate(all_obs, axis=0)
     actions = np.concatenate(all_acts, axis=0)
@@ -58,14 +92,14 @@ def load_expert_data(expert_dir=None):
     return observations, actions
 
 
-def train_bc(expert_dir=None, save_path=None, device=None):
+def train_bc(expert_dir=None, save_path=None, device=None, obs_dim=14):
     """Train a BC model on expert data with validation and LR scheduling."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if save_path is None:
         save_path = config.EXPERT_DIR / "bc_policy.pt"
 
-    observations, actions = load_expert_data(expert_dir)
+    observations, actions = load_expert_data(expert_dir, target_obs_dim=obs_dim)
     obs_dim = observations.shape[1]
     act_dim = actions.shape[1]
 

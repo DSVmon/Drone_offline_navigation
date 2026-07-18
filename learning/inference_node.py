@@ -42,6 +42,7 @@ class InferenceNode(Node):
         self.current_roll = 0.0
         self.current_pitch = 0.0
         self.odom_vx = 0.0
+        self.odom_vz = 0.0
         self.have_data = False
 
         # Subscribers
@@ -80,6 +81,7 @@ class InferenceNode(Node):
         self.current_y = msg.pose.pose.position.y
         self.current_z = msg.pose.pose.position.z
         self.odom_vx = msg.twist.twist.linear.x
+        self.odom_vz = msg.twist.twist.linear.z
         q = msg.pose.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.y * q.x)
         cosy_cosp = 1.0 - 2.0 * (q.x * q.x + q.z * q.z)
@@ -108,6 +110,7 @@ class InferenceNode(Node):
             math.sin(self.current_yaw),
             math.cos(self.current_yaw),
             np.clip(self.odom_vx, -1.0, 1.0),
+            np.clip(self.odom_vz, -1.0, 1.0),
             self.current_roll / math.pi,
             self.current_pitch / math.pi,
         ], dtype=np.float32)
