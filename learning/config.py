@@ -14,9 +14,9 @@ PROJECT_ROOT = LEARNING_DIR.parent
 
 # --- Simulation ---
 HEADLESS = True
-CAVE_CHANGE_INTERVAL = 20
+CAVE_CHANGE_INTERVAL = 1  # Change cave every rollout (matching MAVRL)
 EPISODE_TIMEOUT_SEC = 600
-DT = 0.033  # 30Hz (matching MAVRL)
+DT = 0.1  # 10Hz (matching MAVRL sim_dt=0.1)
 SIM_STEP_TIMEOUT = 2
 
 # --- ROS 2 Topics ---
@@ -69,7 +69,7 @@ ACTIVATION_FN = "relu"
 # --- RecurrentPPO Hyperparameters ---
 TOTAL_TIMESTEPS = 8_000_000
 LEARNING_RATE = 1e-4
-LEARNING_RATE_END = 1e-5  # Linear decay: start 1e-4, end 1e-5 (MAVRL style)
+LEARNING_RATE_END = 0.0  # Linear decay: start 1e-4, end 0 (matching MAVRL)
 N_STEPS = 1000          # steps per rollout per env
 N_SEQ = 1               # sequence length for LSTM
 BATCH_SIZE = 4000
@@ -85,6 +85,8 @@ USE_TANH_ACT = True
 # --- Checkpoints ---
 CHECKPOINT_DIR = LEARNING_DIR / "checkpoints"
 SAVE_FREQ = 20_000
+EVAL_FREQ = 200_000     # Evaluate every 200K steps (matching MAVRL)
+EVAL_EPISODES = 3       # Number of eval episodes per evaluation
 LOG_DIR = LEARNING_DIR / "tensorboard_logs"
 DATA_DIR = LEARNING_DIR / "depth_data"
 
@@ -99,25 +101,26 @@ CAVE_WORLD_PATH = (
 )
 
 # --- Rewards (per-step, matching MAVRL) ---
-R_SURVIVE = 0.01
-R_GOAL_COEFF = 5.0        # progress toward goal (replaces distance_coeff)
-R_SPEED_COEFF = 0.03      # speed bonus (adaptive)
-R_PROXIMITY_PENALTY = -0.1
-R_PROXIMITY_THRESHOLD = 0.5
-R_CENTERING_COEFF = 0.15
+# MAVRL config.yaml coefficients:
+#   distance_coeff: -0.000, angle_vel_coeff: -0.000, input_coeff: -0.0003
+#   yaw_coeff: -0.000, vert_coeff: -0.002, vel_coeff: -0.000, colli_coeff: -0.00
+# MAVRL uses ONLY vert_coeff + input_coeff. All others = 0.
+# We keep R_GOAL_COEFF because we don't have AvoidBench's built-in goal reward.
 
-# MAVRL-style action penalties (smooth flight)
-R_ANGULAR_PENALTY = -0.003    # angle_vel_coeff: penalty for angular velocity
-R_INPUT_PENALTY = -0.0005     # input_coeff: penalty for action changes
-R_YAW_PENALTY = -0.003        # yaw_coeff: penalty for yaw rate
-R_VERTICAL_PENALTY = -0.002   # vert_coeff: penalty for vertical input changes
+R_GOAL_COEFF = 5.0        # progress toward goal (our addition, MAVRL has built-in)
+
+# MAVRL action penalties (smooth flight)
+R_ANGULAR_PENALTY = 0.0   # angle_vel_coeff: MAVRL = 0.0
+R_INPUT_PENALTY = -0.0003 # input_coeff: MAVRL = -0.0003
+R_YAW_PENALTY = 0.0       # yaw_coeff: MAVRL = 0.0
+R_VERTICAL_PENALTY = -0.002  # vert_coeff: MAVRL = -0.002
 
 # --- Rewards (terminal) ---
-R_COLLISION = -5.0
-R_COMPLETION = 50.0       # reached goal
-R_STUCK = -5.0
-R_TIMEOUT = -3.0
-R_OUT_OF_BOUNDS = -10.0
+R_COLLISION = 0.0         # MAVRL: reset_if_collide=true, no penalty
+R_COMPLETION = 50.0       # reached goal (our addition)
+R_STUCK = -5.0            # our addition (MAVRL has no stuck detection)
+R_TIMEOUT = 0.0           # MAVRL: max_t=5.0s, no penalty, just reset
+R_OUT_OF_BOUNDS = -10.0   # our addition (MAVRL has bounding box)
 
 # --- Reset ---
 DRONE_NAME = "rescue_drone"

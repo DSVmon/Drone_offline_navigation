@@ -48,6 +48,8 @@ class InferenceNode(Node):
         self.current_z = config.DRONE_SPAWN_Z
         self.current_yaw = 0.0
         self.vel_world = np.array([0.0, 0.0, 0.0])
+        self.prev_z = config.DRONE_SPAWN_Z
+        self.vz_estimated = 0.0
         self.goal_point = np.array([config.CAVE_LENGTH * config.GOAL_DISTANCE_RATIO, 0.0, config.GOAL_Z])
         self.have_data = False
 
@@ -69,10 +71,11 @@ class InferenceNode(Node):
     def _depth_cb(self, msg):
         try:
             depth = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
-            depth_m = depth / 1000.0 if depth.max() > 100 else depth
-            depth_clamped = np.clip(depth_m, config.DEPTH_MIN, config.DEPTH_MAX)
-            depth_norm = (depth_clamped / config.DEPTH_MAX * 255.0).astype(np.uint8)
-            self.depth_image = cv2.resize(depth_norm, (config.DEPTH_WIDTH, config.DEPTH_HEIGHT))
+            # navigation_node publishes mono8: pixel = depth_m * 255/12
+            # Use directly as uint8 [0,255] — same as drone_env.py
+            if depth.shape != (config.DEPTH_HEIGHT, config.DEPTH_WIDTH):
+                depth = cv2.resize(depth, (config.DEPTH_WIDTH, config.DEPTH_HEIGHT))
+            self.depth_image = depth
         except Exception as e:
             self.get_logger().warn(f"Depth callback error: {e}")
 
@@ -80,10 +83,13 @@ class InferenceNode(Node):
         self.current_x = msg.pose.pose.position.x
         self.current_y = msg.pose.pose.position.y
         self.current_z = msg.pose.pose.position.z
+        # Estimate vz from position change (planar_move doesn't publish Z velocity)
+        self.vz_estimated = (self.current_z - self.prev_z) / config.DT if config.DT > 0 else 0.0
+        self.prev_z = self.current_z
         self.vel_world = np.array([
             msg.twist.twist.linear.x,
             msg.twist.twist.linear.y,
-            msg.twist.twist.linear.z,
+            self.vz_estimated,
         ])
         q = msg.pose.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
@@ -140,14 +146,13 @@ class InferenceNode(Node):
         self.vel_world[2] = np.clip(self.vel_world[2], -1.5, 1.5)
 
         # Publish
+        # Note: planar_move only handles X/Y. Z velocity is published but ignored by plugin.
         msg = Twist()
         msg.linear.x = float(self.vel_world[0])
         msg.linear.y = float(self.vel_world[1])
         msg.linear.z = float(self.vel_world[2])
         msg.angular.z = float(yaw_rate)
         self._cmd_vel_pub.publish(msg)
-
-        self._set_gazebo_z(float(self.vel_world[2]))
 
     def _body2world(self, acc_body):
         cy, sy = math.cos(self.current_yaw), math.sin(self.current_yaw)

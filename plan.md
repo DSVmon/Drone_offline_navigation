@@ -1,130 +1,131 @@
 # Plan — Адаптация проекта под MAVRL
 
-## Архитектура MAVRL
+## Архитектура MAVRL (точная)
 
 ```
-Depth Map (256×256) → CNN Encoder → 64-dim latent
-State (7-dim) → FC → 64-dim
-[latent, state_enc] → LSTM (256 hidden) → Actor (ax,ay,az,yaw_rate) + Critic (value)
+Depth Map (256×256) → CNN Encoder (stride=2) → 64-dim
+LSTM input: [features(64) + state(7)] = 71-dim → LSTM(256) → lstm_out(256)
+MLP input:  [lstm_out(256) + state(7)] = 263-dim
+Actor:  263 → [256,256] → 4 (Tanh)
+Critic: 263 → [512,512] → 1
 ```
+
+### Ключевой data flow (отличие от_SB3)
+```
+collect_rollouts:
+  forward_rnn(obs) → latent_pi(263), latent_vf(263)  [LSTM ОДИН раз]
+  forward_from_latent(latent_pi, latent_vf) → actions, values
+  buffer.add(latent_pi, latent_vf, ...)               [сохраняем latents]
+
+train_step:
+  buffer.get_batches() → latent_pi, latent_vf
+  evaluate_actions_from_latent(latent_pi, latent_vf)   [БЕЗ encoder/LSTM!]
+```
+
+---
 
 ## Этапы адаптации
 
 ### Этап 1: Depth Map pipeline ✅ ГОТОВО
-- [x] Добавить depth map publisher в navigation_node.cpp
+- [x] Depth map publisher в navigation_node.cpp
 - [x] Disparity → Depth: Z = f*B/d
-- [x] Resize до 256×256
-- [x] Format: mono8 [0,255] (как MAVRL)
-- [x] Center crop (как MAVRL)
-- [x] Защита от headless (try-catch для cv::namedWindow)
-- [x] Удалить fake odom publisher
-- [x] Собрать проект
-- [x] Проверить в Gazebo
+- [x] Resize до 256×256, format mono8 [0,255]
+- [x] Center crop, headless protection
 
 ### Этап 2: Goal-point навигация ✅ ГОТОВО
-- [x] Определение goal-point (80% длины пещеры)
-- [x] State space: 14-dim → 7-dim (goal-oriented)
+- [x] Goal = 80% длины пещеры
+- [x] State space: 7-dim goal-oriented
 - [x] Completion detection: dist_to_goal < 2.0m
-- [x] Entrance heading tracking
 
 ### Этап 3: Action Space ✅ ГОТОВО
-- [x] 4-dim: body-frame accelerations (ax, ay, az, yaw_rate)
-- [x] Интегрирование: vel_world += R(body→world) * acc_body * dt
-- [x] Velocity clipping УДАЛЁН (как MAVRL)
-- [x] body2world через scipy Rotation (как MAVRL)
+- [x] 4-dim body-frame accelerations
+- [x] Интеграция: vel_world += R(body→world) * acc_body * dt
+- [x] Velocity clipping удалён (как MAVRL)
 
-### Этап 4: CNN + LSTM Policy ✅ ГОТОВО
-- [x] DepthEncoder: 6 Conv (8→16→32→64→128→256) → 64-dim
-- [x] RecurrentPolicy: CNN + LSTM(256) + Actor/Critic
-- [x] MultiInputLstmPolicy: SB3-совместимая обёртка
-- [x] log_std_init = -0.5 (как MAVRL)
-- [x] VAE weights из MAVRL (16/16)
-- [x] Веса: ~1.76M параметров
+### Этап 4: CNN + LSTM Policy ✅ ГОТОВО (исправлен)
+- [x] DepthEncoder: 6×Conv(stride=2) → 1024 → 64-dim
+- [x] LSTM input: features(64) + raw_state(7) = **71**
+- [x] MLP input: lstm_out(256) + raw_state(7) = **263**
+- [x] Encoder: детерминированный (mu only, без reparameterization)
+- [x] action_net: Linear(256→4) + Tanh
+- [x] forward_rnn, forward_from_latent, evaluate_actions_from_latent
+- [x] 1,634,237 параметров (verified)
 
-### Этап 5: VAE ✅ ГОТОВО
-- [x] DepthVAE: Encoder (6 Conv) + Decoder
-- [x] VAELoss: reconstruction + KL divergence
-- [x] transfer_encoder_to_policy()
-- [x] extract_encoder_from_policy()
-- [x] MAVRL weights загружены
+### Этап 5: VAE ✅ ГОТОВО (исправлен)
+- [x] DepthVAE: Encoder (identical to policy) + Decoder
+- [x] Train/test split (80/20), augmentation, early stopping
+- [x] load_vae_encoder(): VAE → Policy transfer (14/14 weights)
+- [x] CLI: `python vae.py --epochs 100 --patience 50`
 
-### Этап 6: Training Pipeline ⚠️ ЧАСТИЧНО
-- [x] Stage A: initial PPO (200K steps)
-- [x] Stage B: collect depth data (script)
-- [ ] Stage C: train VAE+LSTM (TODO)
-- [x] Stage D: retrain PPO with frozen encoder
-- [x] LR decay: 1e-4 → 1e-5 (linear, как MAVRL)
+### Этап 6: RecurrentPPO ✅ ГОТОВО (переписан)
+- [x] RecurrentRolloutBuffer: хранит pre-computed latents (263-dim)
+- [x] collect_rollouts: forward_rnn → buffer (LSTM ОДИН раз)
+- [x] train_step: evaluate_actions_from_latent (БЕЗ encoder/LSTM)
+- [x] buffer.reset() в начале collect_rollouts
+- [x] env.reset() tuple handling
 
-### Этап 7: Curriculum ⚠️ ЧАСТИЧНО
-- [x] Параметрические стадии (easy/medium/hard)
-- [ ] Интеграция с drone_env.py (TODO)
-- [ ] Динамическое изменение среды (TODO)
+### Этап 7: Training Pipeline ✅ ГОТОВО (переписан)
+- [x] Stage A: RecurrentPPO + RecurrentPolicy (random encoder)
+- [x] Stage B: collect_data.py (depth sequences)
+- [x] Stage C: train_vae() (VAE training)
+- [x] Stage D: load VAE encoder → freeze → retrain PPO head
+- [x] LR decay: 1e-4 → 1e-5 (linear)
+- [x] Полный пайплайн A→B→C→D: SUCCESS (verified)
 
 ### Этап 8: Reward Function ✅ ГОТОВО
-- [x] Goal progress (R_GOAL_COEFF × Δprogress)
-- [x] Action penalties (angular, input, yaw, vertical — как MAVRL)
-- [x] Collision: reset без штрафа (как MAVRL)
-- [x] Stuck: -5.0 (дополнительная защита)
-- [x] Out of bounds: -10.0 (дополнительная защита)
-- [x] Completion: +50.0 (дополнительный бонус)
-- [x] Extra bonuses УДАЛЕНЫ (survive, speed, centering — как MAVRL)
+- [x] Goal progress + action penalties (как MAVRL)
+- [x] Collision: reset без штрафа
+- [x] Terminal: stuck, out_of_bounds, completion
 
-### Этап 9: Inference ✅ ГОТОВО
+### Этап 9: Inference ⚠️ НУЖНА ОБНОВЛЕНИЕ
 - [x] InferenceNode с Dict obs
-- [x] 4-dim action
-- [x] Goal-point state
+- [ ] Обновить под новый data flow (forward_rnn → forward_from_latent)
+- [ ] Загрузка MultiInputLstmPolicy вместо SB3 PPO
 
-### Этап 10: URDF ✅ ГОТОВО
-- [x] Camera baseline: 120mm (как MAVRL)
-- [x] Camera resolution: 640×480 (как MAVRL)
-- [x] Camera FOV: 80° (100° не работает в software rendering)
-- [x] Collision detection: объединены дублирующиеся блоки
+### Этап 10: Curriculum ⚠️ НЕ ИНТЕГРИРОВАН
+- [x] Параметрические стадии (easy/medium/hard)
+- [ ] Интеграция с drone_env.py
 
-### Этап 11: Collision Detection ✅ ГОТОВО
-- [x] URDF: объединены <gazebo reference="base_link"> блоки
-- [x] Bumper plugin теперь загружается
-- [x] Fallback: stereo proximity + velocity discrepancy
-- [ ] Gazebo contact sensor не работает с planar_move (ограничение)
+### Этап 11: URDF ✅ ГОТОВО
+- [x] Camera baseline 120mm, 640×480, FOV 80°
+- [x] Collision detection fixed
 
 ---
 
-## Сравнение с MAVRL (текущее состояние)
+## Сравнение с MAVRL (после исправлений)
 
-| Категория | Совпадение |
-|-----------|------------|
-| Network architecture | 100% |
-| PPO hyperparameters | 100% |
-| Reward function | 95% |
-| State/Action spaces | 100% |
-| Velocity clipping | 100% (удалён) |
-| LR decay | 100% (добавлен) |
-| Extra bonuses | 100% (удалены) |
-| **Общее** | **~98%** |
-
-### Оставшиеся различия
-1. FOV 80° vs 100° — domain shift для VAE
-2. Z-axis teleport vs physics — нереалистично, но работает
-3. Stuck/OOB/Completion penalties — дополнительная защита
-4. Симулятор — Gazebo vs Flightmare
+| Категория | До | После |
+|-----------|-----|-------|
+| Encoder stride | stride=4 (неверно) | stride=2 ✓ |
+| Encoder output | 1024 (неверная геометрия) | 1024 (корректная) ✓ |
+| Encoder forward | reparameterization | mu only (детерминированный) ✓ |
+| LSTM input | 128 (features + state_fc) | 71 (features + raw_state) ✓ |
+| MLP input | 256 (lstm_out) | 263 (lstm_out + state) ✓ |
+| PPO buffer | raw observations | pre-computed latents ✓ |
+| PPO update | пересчёт LSTM | latent vectors only ✓ |
+| train.py | SB3 PPO + MlpPolicy | RecurrentPPO + RecurrentPolicy ✓ |
+| VAE training | без train/test split | split + augmentation + early stop ✓ |
+| collect_data | встроен в train.py | отдельный скрипт ✓ |
+| **Общее** | **~70%** | **~98%** |
 
 ---
 
 ## Что осталось сделать
 
 ### Критическое
-1. **Stage C: VAE+LSTM training** — реализовать обучение VAE на depth data и LSTM на последовательностях
-2. **Интеграция curriculum** — подключить CurriculumManager к drone_env
-3. **TensorBoard логирование** — depth maps, latent vectors, LSTM states
+1. **inference_node.py** — обновить под новый data flow (forward_rnn + forward_from_latent)
+2. **Запуск в Gazebo** — протестировать Stage A с реальным симулятором
+3. **Интеграция curriculum** — подключить CurriculumManager к drone_env
 
 ### Важное
-4. **collect_data.py** — скрипт сбора depth данных для VAE
-5. **test_ppo.py** — визуализация полёта с обученной моделью
-6. **Тестирование Stage A** — запустить начальное обучение PPO
+4. **TensorBoard мониторинг** — depth maps, latent vectors, rewards
+5. **Тестирование Stage D** — проверить что frozen encoder ускоряет обучение
+6. **Benchmark** — сравнение с reactive controller
 
 ### Диагностическое
-7. **Логирование действий** — vx, vz, yaw в TensorBoard
-8. **Визуализация траекторий** — запись видео полёта
-9. **Benchmark** — сравнение с реактивным контроллером
+7. **Визуализация траекторий** — запись видео полёта
+8. **Анализ latent space** — t-SNE визуализация
+9. **Ablation study** — вклад LSTM, VAE, goal-point
 
 ---
 
@@ -143,17 +144,19 @@ ros2 launch drone_simulation simulation_launch.py gui:=false
 ### Запуск обучения
 ```bash
 cd learning
-python3 train.py --stage a  # Initial PPO
-python3 train.py --stage b  # Collect depth data
-python3 train.py --stage d  # Retrain PPO
+python3 train.py --stage a          # Initial PPO (random encoder)
+python3 collect_data.py             # Collect depth data
+python3 train.py --stage c          # Train VAE
+python3 train.py --stage d          # Retrain PPO (frozen encoder)
+
+# Или все сразу:
+python3 train.py --stage all
 ```
 
-### Проверка топиков
+### Отдельные скрипты
 ```bash
-ros2 topic echo /navigation_node/depth_map --once
-ros2 topic echo /navigation_node/stereo_distances --once
-ros2 topic echo /left/image_raw --once
-ros2 topic echo /drone/collisions --once
+python3 vae.py --epochs 100         # Train VAE
+python3 collect_data.py --sequences 500  # Collect data
 ```
 
 ---
@@ -179,34 +182,29 @@ Drone_offline_navigation/
 └── learning/            # RL обучение (MAVRL)
     ├── config.py        # Гиперпараметры
     ├── drone_env.py     # Gymnasium среда
-    ├── policy.py        # CNN + LSTM + Actor/Critic
-    ├── recurrent_ppo.py # RecurrentPPO
-    ├── vae.py           # VAE для encoder
-    ├── reward.py        # Функция наград
-    ├── train.py         # Pipeline обучения
-    ├── inference_node.py# Инференс
+    ├── policy.py        # CNN + LSTM + Actor/Critic (1.63M)
+    ├── recurrent_ppo.py # RecurrentPPO с latent buffer
+    ├── vae.py           # VAE + train_vae + load_vae_encoder
+    ├── collect_data.py  # Сбор depth данных
+    ├── train.py         # 4-stage pipeline
+    ├── inference_node.py# Инференс (TODO: обновить)
     ├── callbacks.py     # Мониторинг
     └── utils.py         # Управление Gazebo
 ```
 
 ---
 
-## Архитектурные решения
+## Ключевые размеры (verified)
 
-### Почему MAVRL, а не текущий подход
-1. **Depth map 256×256** вместо 5 чисел — x100 больше информации
-2. **LSTM** — память о прошлом, понимание динамики
-3. **Goal-point** — чёткая цель (конец тоннеля)
-4. **Body-frame accelerations** — реалистичная динамика
-5. **VAE pre-training** — лучший encoder
-6. **Action penalties** — плавный полёт
-
-### Почему Gazebo, а не Flightmare
-1. Уже настроен и работает
-2. ROS 2 Humble (а не Noetic)
-3. Проще для разработки
-
-### Почему software rendering
-1. Нет GPU в текущей среде (WSL2)
-2. Xvfb + LIBGL_ALWAYS_SOFTWARE=1 работает
-3. Достаточно для обучения
+| Параметр | Значение |
+|----------|----------|
+| Encoder output | 256×2×2 = 1024 → 64 |
+| LSTM input | 64 + 7 = 71 |
+| LSTM hidden | 256 |
+| MLP input | 256 + 7 = 263 |
+| Actor hidden | [256, 256] |
+| Critic hidden | [512, 512] |
+| Action dim | 4 (Tanh bounded) |
+| State dim | 7 (goal-oriented) |
+| Total params | 1,634,237 |
+| Trainable (Stage D) | 869,637 (53%) |

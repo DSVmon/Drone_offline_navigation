@@ -72,9 +72,12 @@ class DroneEnv(gym.Env):
         self.current_yaw = 0.0
         self.current_roll = 0.0
         self.current_pitch = 0.0
+        self.current_quat = np.array([0.0, 0.0, 0.0, 1.0])  # Full quaternion (x,y,z,w)
         self.odom_vx = 0.0
         self.odom_vy = 0.0
         self.odom_vz = 0.0
+        self.prev_z = config.DRONE_SPAWN_Z  # For vz estimation (planar_move has no Z velocity)
+        self.vz_estimated = 0.0  # Estimated vertical velocity from position change
         self.collision_detected = False
         self.collision_type = "NONE"
         self._collision_countdown = 0
@@ -192,8 +195,10 @@ class DroneEnv(gym.Env):
             self.current_z = msg.pose.pose.position.z
             self.odom_vx = msg.twist.twist.linear.x
             self.odom_vy = msg.twist.twist.linear.y
-            self.odom_vz = msg.twist.twist.linear.z
-            self.vel_world = np.array([self.odom_vx, self.odom_vy, self.odom_vz])
+            # planar_move doesn't publish Z velocity — estimate from position change
+            self.vz_estimated = (self.current_z - self.prev_z) / config.DT if config.DT > 0 else 0.0
+            self.prev_z = self.current_z
+            self.vel_world = np.array([self.odom_vx, self.odom_vy, self.vz_estimated])
 
             q = msg.pose.pose.orientation
             sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
@@ -209,6 +214,9 @@ class DroneEnv(gym.Env):
             siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
             cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
             self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+            # Store full quaternion for world2body (matching MAVRL)
+            self.current_quat = np.array([q.x, q.y, q.z, q.w])
 
             self._obs_timestamp += 1
 
@@ -229,8 +237,8 @@ class DroneEnv(gym.Env):
     def _world2body(self, world_vel):
         """Convert world-frame velocity to body-frame (RFU). Matching MAVRL."""
         from scipy.spatial.transform import Rotation
-        quat = [0.0, 0.0, math.sin(self.current_yaw / 2.0), math.cos(self.current_yaw / 2.0)]
-        rot = Rotation.from_quat(quat)
+        # Use full quaternion from odometry (matching MAVRL RobotState.world2body)
+        rot = Rotation.from_quat(self.current_quat)  # [x, y, z, w]
         # World RFU → FLU
         world_flu = np.array([world_vel[1], -world_vel[0], world_vel[2]])
         # Rotate to body FLU
@@ -242,7 +250,8 @@ class DroneEnv(gym.Env):
         """Build MAVRL-style observation: Dict{image, state}."""
         with self._lock:
             pos = np.array([self.current_x, self.current_y, self.current_z])
-            vel = np.array([self.odom_vx, self.odom_vy, self.odom_vz])
+            # Use estimated vz (planar_move doesn't publish Z velocity)
+            vel = np.array([self.odom_vx, self.odom_vy, self.vz_estimated])
             yaw = self.current_yaw
 
         # Goal-oriented state (7-dim, MAVRL style)
@@ -285,15 +294,13 @@ class DroneEnv(gym.Env):
         self.vel_world = self.vel_world + acc_world * config.DT
 
         # Publish velocity command (no clipping, like MAVRL)
+        # Note: planar_move only handles X/Y. Z velocity is published but ignored by plugin.
         msg = Twist()
         msg.linear.x = float(self.vel_world[0])
         msg.linear.y = float(self.vel_world[1])
         msg.linear.z = float(self.vel_world[2])
         msg.angular.z = float(yaw_rate)
         self._cmd_vel_pub.publish(msg)
-
-        # Z-axis via Gazebo service
-        self._set_gazebo_z(float(self.vel_world[2]))
 
         self.last_vx_cmd = float(self.vel_world[0])
         self.last_vz_cmd = float(self.vel_world[2])
@@ -307,9 +314,8 @@ class DroneEnv(gym.Env):
     def _body2world(self, acc_body):
         """Body-frame acceleration → world-frame (RFU). Matching MAVRL."""
         from scipy.spatial.transform import Rotation
-        # Convert yaw to quaternion (like MAVRL)
-        quat = [0.0, 0.0, math.sin(self.current_yaw / 2.0), math.cos(self.current_yaw / 2.0)]
-        rot = Rotation.from_quat(quat)
+        # Use full quaternion from odometry (matching MAVRL RobotState.body2world)
+        rot = Rotation.from_quat(self.current_quat)  # [x, y, z, w]
         # Body RFU → FLU
         flu = np.array([acc_body[1], -acc_body[0], acc_body[2]])
         # Rotate to world FLU
@@ -324,9 +330,9 @@ class DroneEnv(gym.Env):
 
         with self._lock:
             cx, cy, cz = self.current_x, self.current_y, self.current_z
-            yaw = self.current_yaw
+            quat = self.current_quat  # Full quaternion [x, y, z, w]
 
-        # Limit Z speed: max 0.3m per step (≈9m/s at 30Hz)
+        # Limit Z speed: max 0.3m per step (≈3m/s at 10Hz)
         max_z_step = 0.3
         z_step = np.clip(vz * config.DT, -max_z_step, max_z_step)
         target_z = cz + z_step
@@ -338,12 +344,10 @@ class DroneEnv(gym.Env):
         req.state.pose.position.x = cx
         req.state.pose.position.y = cy
         req.state.pose.position.z = target_z
-        qz = math.sin(yaw / 2.0)
-        qw = math.cos(yaw / 2.0)
-        req.state.pose.orientation.x = 0.0
-        req.state.pose.orientation.y = 0.0
-        req.state.pose.orientation.z = float(qz)
-        req.state.pose.orientation.w = float(qw)
+        req.state.pose.orientation.x = float(quat[0])
+        req.state.pose.orientation.y = float(quat[1])
+        req.state.pose.orientation.z = float(quat[2])
+        req.state.pose.orientation.w = float(quat[3])
         req.state.twist.linear.z = float(vz)
         req.state.reference_frame = "world"
 
@@ -455,40 +459,38 @@ class DroneEnv(gym.Env):
         terminated = False
         reward = 0.0
 
-        # 1. Goal progress (matching MAVRL: distance_coeff × (-Δdistance))
         dist_to_goal = np.linalg.norm(pos - self.goal_point)
+
+        # 1. Goal progress (our addition — MAVRL has this built into AvoidBench)
         prev_dist = np.linalg.norm(
             np.array([prev_pos[0], prev_pos[1], pos[2]]) - self.goal_point
         )
         progress = prev_dist - dist_to_goal
         reward += config.R_GOAL_COEFF * progress
 
-        # 2. MAVRL-style action penalties (smooth flight)
-        # Angular velocity penalty
-        reward += config.R_ANGULAR_PENALTY * abs(self._saved_prev_angular_vel)
-        
-        # Input change penalty (action smoothness)
+        # 2. Action penalties (matching MAVRL config.yaml exactly)
+        # input_coeff = -0.0003: penalty for action changes between steps
         action_delta = np.linalg.norm(self.prev_action - self._saved_prev_action)
         reward += config.R_INPUT_PENALTY * action_delta
-        
-        # Yaw rate penalty
-        reward += config.R_YAW_PENALTY * abs(self._saved_prev_angular_vel)
-        
-        # Vertical input penalty
+
+        # vert_coeff = -0.002: penalty for vertical input
         reward += config.R_VERTICAL_PENALTY * abs(self._saved_prev_vz_input)
 
-        # 3. Collision (terminal) — MAVRL: reset_if_collide=true, no penalty
+        # Note: MAVRL has angle_vel_coeff=0, yaw_coeff=0, vel_coeff=0
+        # We removed our extra angular/yaw penalties to match MAVRL
+
+        # 3. Collision → reset (MAVRL: reset_if_collide=true, no reward penalty)
         if collision:
             info["termination_reason"] = "collision"
             terminated = True
 
-        # 4. Stuck (terminal)
+        # 4. Stuck → reset (our addition, MAVRL has timeout instead)
         if stuck:
             reward += config.R_STUCK
             info["termination_reason"] = "stuck"
             terminated = True
 
-        # 8. Out of bounds (terminal)
+        # 5. Out of bounds → reset (MAVRL has bounding_box check)
         out_of_bounds = (
             pos[2] < config.DRONE_MIN_Z
             or pos[2] > config.DRONE_MAX_Z
@@ -500,16 +502,16 @@ class DroneEnv(gym.Env):
             info["termination_reason"] = "out_of_bounds"
             terminated = True
 
-        # 9. Goal reached (terminal, success)
+        # 6. Goal reached → success (MAVRL: terminal observation, positive reward)
         if dist_to_goal < config.GOAL_REACHED_THRESHOLD:
             reward += config.R_COMPLETION
             info["termination_reason"] = "completed_lap"
             terminated = True
 
-        # 10. Timeout
+        # 7. Timeout → reset (MAVRL: max_t=5.0, no penalty)
         if elapsed > config.EPISODE_TIMEOUT_SEC:
-            reward += config.R_TIMEOUT
             info["termination_reason"] = "timeout"
+            terminated = True
 
         return reward, terminated, info
 
@@ -523,6 +525,8 @@ class DroneEnv(gym.Env):
         self._near_wall_count = 0
         self._pos_history.clear()
         self.vel_world = np.array([0.0, 0.0, 0.0])
+        self.prev_z = config.DRONE_SPAWN_Z
+        self.vz_estimated = 0.0
 
         with self._lock:
             self.collision_detected = False

@@ -25,20 +25,11 @@ public:
   {
     // ... (existing parameters)
     
-    // Create OpenCV window for automatic visualization (skip in headless)
-    try {
-      cv::namedWindow("Drone View: Rectified Left", cv::WINDOW_AUTOSIZE);
-      cv::namedWindow("Drone View: Disparity", cv::WINDOW_AUTOSIZE);
-      cv::startWindowThread();
-      headless_ = false;
-    } catch (...) {
-      RCLCPP_WARN(this->get_logger(), "Cannot create OpenCV windows (headless mode)");
-      headless_ = true;
-    }
+    // No OpenCV windows needed — vis_camera is used for visualization via ROS topic
 
-    // Initialize BM (Block Matching) - Much faster than SGBM for real-time performance
-    int num_disparities = 64; 
-    int block_size = 21; // BM usually needs larger block size than SGBM (e.g., 15-21)
+    // Initialize BM (Block Matching) - Full resolution for better depth quality
+    int num_disparities = 128;  // Increased for full-res (was 64 at half-res)
+    int block_size = 21;
     
     bm_ = cv::StereoBM::create(num_disparities, block_size);
     bm_->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
@@ -79,8 +70,8 @@ public:
         current_x_ = msg->pose.pose.position.x;
       });
 
-    // Debug publisher for rectified image
-    rectified_pub_ = this->create_publisher<sensor_msgs::msg::Image>("~/debug_rectified_left", 10);
+    // Publisher for left camera visualization (rectified image)
+    left_pub_ = this->create_publisher<sensor_msgs::msg::Image>("~/left_camera", 10);
 
     // Camera Info Subscribers (using simple subscribers as they are usually static)
     left_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
@@ -150,22 +141,11 @@ private:
       cv::cvtColor(right_raw, right_mono, cv::COLOR_BGR2GRAY);
 
       // 2. Rectification (Align images)
-      cv::Mat left_rect_full, right_rect_full;
-      stereo_model_.left().rectifyImage(left_mono, left_rect_full);
-      stereo_model_.right().rectifyImage(right_mono, right_rect_full);
-
-      // 2.5 Downsample for speed (Half resolution = 4x faster)
       cv::Mat left_rect, right_rect;
-      cv::pyrDown(left_rect_full, left_rect);
-      cv::pyrDown(right_rect_full, right_rect);
+      stereo_model_.left().rectifyImage(left_mono, left_rect);
+      stereo_model_.right().rectifyImage(right_mono, right_rect);
 
-      // 4. Automatic Window Display (skip in headless)
-      if (!headless_) {
-        cv::imshow("Drone View: Rectified Left", left_rect);
-        cv::waitKey(1);
-      }
-
-      // 5. Compute Disparity Map
+      // 5. Compute Disparity Map (full resolution)
       cv::Mat disparity_16s, disparity_8u;
       
       bm_->compute(left_rect, right_rect, disparity_16s);
@@ -173,9 +153,6 @@ private:
       // Normalize for better visualization
       cv::Mat disp_visible;
       disparity_16s.convertTo(disp_visible, CV_32F, 1.0 / 16.0); // Convert to actual pixel disparity
-      
-      // Scale disparity back to full-res for distance calculation
-      disp_visible *= 2.0;
 
       double min_val, max_val;
       cv::minMaxLoc(disp_visible, &min_val, &max_val);
@@ -187,10 +164,10 @@ private:
       cv::applyColorMap(disparity_8u, disparity_8u, cv::COLORMAP_JET);
 
       // 6. Multi-Zone Distance Calculation (Left, Center, Right, Top, Bottom)
-      int zone_width = 80; 
-      int zone_height = 60;
+      int zone_width = 160;   // Doubled for full resolution (was 80 at half-res)
+      int zone_height = 120;  // Doubled for full resolution (was 60 at half-res)
       
-      double fy = stereo_model_.left().fy() * 0.5;
+      double fy = stereo_model_.left().fy(); // full resolution
       int pitch_offset = static_cast<int>(pitch * fy);
       
       int start_x = (left_rect.cols - (zone_width * 3)) / 2;
@@ -236,19 +213,6 @@ private:
       }
 
       // Show windows with debug overlays (skip in headless)
-      if (!headless_) {
-        cv::imshow("Drone View: Rectified Left", debug_rect);
-        
-        cv::Mat disparity_with_roi = disparity_8u.clone();
-        for (size_t zone = 0; zone < rois.size(); ++zone) {
-          cv::Scalar color = (zone == 1) ? cv::Scalar(0, 255, 0) : cv::Scalar(255, 0, 0);
-          if (zone >= 3) color = cv::Scalar(0, 255, 255);
-          cv::rectangle(disparity_with_roi, rois[zone], color, 2);
-        }
-        cv::imshow("Drone View: Disparity", disparity_with_roi);
-        cv::waitKey(1);
-      }
-
       // Publish multi-zone distances
       auto dist_msg = std_msgs::msg::Float32MultiArray();
       dist_msg.data = zone_min_dists;
@@ -259,7 +223,7 @@ private:
       cv::Mat depth_map_32f;
       disp_visible.copyTo(depth_map_32f);
 
-      float focal_length = stereo_model_.left().fx() * 0.5; // half-res
+      float focal_length = stereo_model_.left().fx(); // full resolution
       float baseline = stereo_model_.baseline();
 
       for (int v = 0; v < depth_map_32f.rows; ++v) {
@@ -294,8 +258,9 @@ private:
       auto depth_img_msg = cv_bridge::CvImage(depth_header, "mono8", depth_map_resized).toImageMsg();
       depth_map_pub_->publish(*depth_img_msg);
 
+      // Publish rectified left image for visualization
       auto debug_img_msg = cv_bridge::CvImage(left_msg->header, "bgr8", debug_rect).toImageMsg();
-      rectified_pub_->publish(*debug_img_msg);
+      left_pub_->publish(*debug_img_msg);
 
     } catch (cv_bridge::Exception& e) {
       RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
@@ -324,7 +289,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr stereo_dist_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_map_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr rectified_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr left_pub_;
 };
 
 int main(int argc, char ** argv)

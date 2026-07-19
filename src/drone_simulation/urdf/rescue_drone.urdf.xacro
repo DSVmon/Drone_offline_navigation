@@ -71,7 +71,7 @@
         <remapping>cmd_vel:=/cmd_vel</remapping>
         <remapping>odom:=/odom</remapping>
       </ros>
-      <update_rate>50</update_rate>
+      <update_rate>200</update_rate>  <!-- Matching MAVRL (was 50) -->
       <publish_odom>true</publish_odom>
       <publish_odom_tf>true</publish_odom_tf>
       <odometry_frame>odom</odometry_frame>
@@ -174,7 +174,7 @@
         </image>
         <clip>
           <near>0.02</near>
-          <far>300</far>
+          <far>15</far>
         </clip>
       </camera>
       <plugin name="left_camera_controller" filename="libgazebo_ros_camera.so">
@@ -201,7 +201,7 @@
         </image>
         <clip>
           <near>0.02</near>
-          <far>300</far>
+          <far>15</far>
         </clip>
       </camera>
       <plugin name="right_camera_controller" filename="libgazebo_ros_camera.so">
