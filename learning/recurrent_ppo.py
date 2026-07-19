@@ -189,7 +189,12 @@ class RecurrentPPO:
 
         for step in range(self.n_steps):
             # Prepare observation tensors: (B=1, T=1, C, H, W) and (B=1, T=1, state_dim)
+            # Normalize depth: uint8 [0,255] → float32 [0,1] (matching MAVRL preprocess_obs)
             image = torch.FloatTensor(obs['image']).reshape(1, 1, 1, config.DEPTH_HEIGHT, config.DEPTH_WIDTH).to(self.device)
+            if image.dtype == torch.uint8:
+                image = image.float() / 255.0
+            elif image.max() > 1.0:
+                image = image.float() / 255.0  # uint8 was converted to float by torch.FloatTensor
             state = torch.FloatTensor(obs['state']).reshape(1, 1, config.STATE_DIM).to(self.device)
 
             # 1. Forward through encoder + LSTM (ONCE)

@@ -84,7 +84,10 @@ def collect_data(checkpoint_path, num_sequences=500, seq_length=100,
 
         for step in range(seq_length):
             # Prepare observation
+            # Normalize depth: uint8 [0,255] → float32 [0,1] (matching MAVRL preprocess_obs)
             image = torch.FloatTensor(obs['image']).unsqueeze(0).unsqueeze(0).to(device)
+            if image.max() > 1.0:
+                image = image.float() / 255.0
             state = torch.FloatTensor(obs['state']).unsqueeze(0).unsqueeze(0).to(device)
 
             with torch.no_grad():
@@ -145,10 +148,10 @@ def main():
     parser.add_argument("--checkpoint", type=str,
                         default=str(config.CHECKPOINT_DIR / "stage_a_final.pth"),
                         help="Path to trained policy checkpoint")
-    parser.add_argument("--sequences", type=int, default=500,
-                        help="Number of trajectory sequences to collect")
-    parser.add_argument("--seq-length", type=int, default=100,
-                        help="Steps per sequence")
+    parser.add_argument("--sequences", type=int, default=1000,
+                        help="Number of trajectory sequences (MAVRL: 1000)")
+    parser.add_argument("--seq-length", type=int, default=1000,
+                        help="Steps per sequence (MAVRL: 1000)")
     parser.add_argument("--headless", action="store_true", default=True,
                         help="Run Gazebo headless")
     parser.add_argument("--output-dir", type=str, default=None,

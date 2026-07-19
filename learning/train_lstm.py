@@ -124,10 +124,8 @@ class LSTMReconstructor(nn.Module):
             img_flat = images.reshape(B * T, 1, 256, 256)
             features = self.encoder(img_flat)  # (B*T, 64)
 
-        # 2. LSTM input: [features, state]
-        state_flat = states.reshape(B * T, self.state_dim)
-        lstm_in = torch.cat([features, state_flat], dim=-1)  # (B*T, 71)
-        lstm_in = lstm_in.reshape(B, T, -1)
+        # 2. LSTM input: features ONLY (matching MAVRL — state NOT in LSTM)
+        lstm_in = features.reshape(B, T, -1)  # (B, T, 64)
 
         # 3. Run LSTM
         lstm_out, new_hidden = self.lstm(lstm_in, lstm_hidden)  # (B, T, 256)
@@ -250,16 +248,38 @@ def train_lstm(args):
                        list(reconstructor.mu_linear.parameters())
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
 
-    # 6. Training loop
-    print(f"[LSTM] Training for {args.epochs} epochs, seq_len={args.seq_len}")
-    print(f"[LSTM] Recon members: past={args.recon[0]}, current={args.recon[1]}, future={args.recon[2]}")
-
-    best_loss = float('inf')
+    # 6. Check for resume
     save_dir = Path(config.DATA_DIR) / "lstm"
     save_dir.mkdir(parents=True, exist_ok=True)
+    start_epoch = 1
+    best_loss = float('inf')
+
+    if args.resume:
+        # Try to find last checkpoint
+        last_ckpt = sorted(save_dir.glob("lstm_epoch_*.pth"))
+        if last_ckpt:
+            resume_path = last_ckpt[-1]
+            print(f"[LSTM] Resuming from {resume_path.name}")
+            ckpt = torch.load(resume_path, map_location=device)
+            reconstructor.lstm.load_state_dict(ckpt['lstm_state_dict'])
+            reconstructor.mu_linear.load_state_dict(ckpt['mu_linear_state_dict'])
+            start_epoch = ckpt['epoch'] + 1
+            print(f"[LSTM] Resumed from epoch {ckpt['epoch']}, continuing from {start_epoch}")
+
+        # Also load best loss
+        best_ckpt = save_dir / "best_lstm.tar"
+        if best_ckpt.exists():
+            best_ckpt_data = torch.load(best_ckpt, map_location=device)
+            best_loss = best_ckpt_data.get('loss', float('inf'))
+            print(f"[LSTM] Best loss so far: {best_loss:.4f}")
+
+    # 7. Training loop
+    remaining = args.epochs - start_epoch + 1
+    print(f"[LSTM] Training for {remaining} epochs (from {start_epoch} to {args.epochs})")
+    print(f"[LSTM] Recon members: past={args.recon[0]}, current={args.recon[1]}, future={args.recon[2]}")
 
     start_time = time.time()
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         reconstructor.train()
         total_loss = 0.0
         n_batches = 0
@@ -355,6 +375,8 @@ def main():
                        help="Save checkpoint every N epochs")
     parser.add_argument("--recon", nargs='+', type=int, default=[0, 0, 1],
                        help="Reconstruct [past, current, future] (MAVRL: [0,0,1])")
+    parser.add_argument("--resume", action="store_true",
+                       help="Resume from last checkpoint")
     args = parser.parse_args()
 
     args.recon = [bool(x) for x in args.recon]

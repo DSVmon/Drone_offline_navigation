@@ -507,3 +507,79 @@ bool use_stereo_vision_;
 - MAVRL использует SGM (Semi-Global Matching) GPU stereo depth
 - Domain shift между нашими проектами ГОРАЗДО меньше чем предполагалось
 - Основное различие: SGM (CUDA) vs StereoBM (CPU)
+
+---
+
+## Дата: 19 июля 2026 (нормализация, LSTM,.resume, pipeline test)
+
+### 61. КРИТИЧЕСКИЙ БАГ: нормализация depth не применялась
+**Баг**: `torch.FloatTensor(numpy_uint8)` конвертирует uint8→float32, НО НЕ нормализует.
+Encoder получал float32 [0,255] вместо [0,1] — activations в 256 раз больше чем нужно.
+**Проверка**: `if x.dtype == torch.uint8` в encoder НЕ срабатывала (x уже float32).
+**Исправление**: добавлена нормализация `/255.0` в `recurrent_ppo.collect_rollouts()` и `collect_data.py`.
+
+### 62. Исправлена LSTM архитектура (states_dim=0)
+**Было**: LSTM input = features(64) + state(7) = 71 (state ВНУТРИ LSTM)
+**Стало**: LSTM input = features(64) = 64 (state НЕ в LSTM, только в MLP)
+- MAVRL использует `states_dim=0` — state подаётся только после LSTM
+- LSTM weight_ih: (1024,71) → (1024,64)
+- Исправлены: policy.py (forward, forward_rnn), train_lstm.py (LSTMReconstructor)
+
+### 63. Реализован Stage C+ (LSTM training)
+- Создан `train_lstm.py` — LSTMReconstructor, reconstruction_loss, train_lstm()
+- Архитектура: encoder(frozen) → LSTM → mu_linear → decoder → reconstruction
+- Recon members: [0,0,1] (future only, как MAVRL)
+- 2000 epochs default, saves best_lstm.tar
+
+### 64. Реализован eval environment
+- Создан `vec_drone_env.py`: VecDroneEnv + EvalDroneEnv
+- RecurrentPPO: eval_env, eval_freq=200K, eval_episodes=3
+- _run_eval(): N deterministic episodes, logs success_rate
+
+### 65. Resume для всех этапов
+- Stage A: --resume, find_last_checkpoint(), resume_training()
+- Stage B: resume — дописывает к существующим данным
+- Stage C: train_vae() загружает существующий best.tar
+- Stage C+: train_lstm() загружает lstm_epoch_XXXXX.pth
+- Stage D: --resume, find_last_checkpoint()
+
+### 66. Увеличен объём данных
+- Sequences: 500 → 1000 (matching MAVRL)
+- Seq length: 100 → 1000 (matching MAVRL)
+- Total: 50K → 1M samples
+
+### 67. Добавлены transforms (как MAVRL)
+- transforms: ToPILImage → Resize(256,256) → RandomHorizontalFlip → ToTensor
+- DepthImageDataset: корректно применяет transforms
+
+### 68. Far clip уменьшен
+- URDF: camera far clip 300m → 15m (совпадает с depth clamp + запас)
+
+### 69. Создан mavrl_inference.py
+- Загрузка MAVRL checkpoint → RecurrentPolicy
+- Inference pipeline: depth → normalize → encoder → LSTM → action
+- Fallback: если MAVRL weights недоступны — training from scratch
+
+### 70. Fallback для MAVRL weights
+- `try_load_mavrl_encoder()`: загружает encoder weights, fallback random
+- `try_load_mavrl_lstm()`: загружает LSTM weights, fallback random
+- Оба с graceful error handling
+
+### 71. Полный pipeline test: ALL 8 STAGES PASSED
+```
+1. Camera → Normalize → Model Input     ✓ depth [0,1], state (7,)
+2. Forward pass                          ✓ latent (263), action (4)
+3. Stage A: PPO                          ✓ 450 steps, saved 10.8MB
+4. Stage B: Collect                      ✓ 1000 samples
+5. Stage C: VAE                          ✓ 10 epochs, best=3.52
+6. Stage C+: LSTM                        ✓ 5 epochs, saved 1.5MB
+7. Stage D: Retrain PPO                  ✓ Frozen enc+lstm, 32.7% trainable
+8. Inference                             ✓ Actions in [-1,1]
+Total time: 81.5s
+```
+
+### 72. Исправленные баги в процессе
+- `recurrent_ppo.py`: добавлена нормализация /255.0 перед encoder
+- `collect_data.py`: добавлена нормализация /255.0 перед encoder
+- `policy.py forward()`: LSTM input исправлен features(64) вместо features+state(71)
+- `train_lstm.py LSTMReconstructor`: LSTM input исправлен features(64) вместо 71

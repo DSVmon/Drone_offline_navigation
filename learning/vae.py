@@ -171,11 +171,12 @@ class DepthImageDataset(Dataset):
     def __getitem__(self, idx):
         img = self.images[idx]  # (256, 256) uint8
 
-        # Convert to float tensor [0, 1] with channel dim
-        img_tensor = torch.FloatTensor(img).unsqueeze(0) / 255.0  # (1, 256, 256)
-
         if self.transform:
-            img_tensor = self.transform(img_tensor)
+            # Apply transforms (includes ToPILImage → Resize → ToTensor)
+            img_tensor = self.transform(img)  # (1, 256, 256) float32 [0,1]
+        else:
+            # Manual conversion if no transform
+            img_tensor = torch.FloatTensor(img).unsqueeze(0) / 255.0  # (1, 256, 256)
 
         return img_tensor
 
@@ -218,9 +219,12 @@ def train_vae(data_path=None, save_path=None, epochs=100, batch_size=32,
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Transforms (matching MAVRL)
+    # Transforms (matching MAVRL trainvae.py)
     transform_train = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((config.DEPTH_HEIGHT, config.DEPTH_WIDTH)),
         transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),  # Converts uint8 [0,255] → float32 [0,1]
     ])
 
     # Create datasets
@@ -242,10 +246,27 @@ def train_vae(data_path=None, save_path=None, epochs=100, batch_size=32,
     # Early stopping (matching MAVRL)
     best_loss = float('inf')
     patience_counter = 0
+    start_epoch = 1
 
-    print(f"[VAE] Training for {epochs} epochs, batch_size={batch_size}")
+    # Resume from existing checkpoint
+    if save_path.exists():
+        print(f"[VAE] Found existing checkpoint at {save_path}")
+        try:
+            checkpoint = torch.load(save_path, map_location=device)
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_loss = checkpoint.get('precision', float('inf'))
+            print(f"[VAE] Resumed from epoch {start_epoch - 1}, best loss: {best_loss:.4f}")
+        except Exception as e:
+            print(f"[VAE] Could not load checkpoint: {e}")
+            print("[VAE] Starting fresh")
 
-    for epoch in range(1, epochs + 1):
+    remaining = epochs - start_epoch + 1
+    print(f"[VAE] Training for {remaining} epochs (from {start_epoch} to {epochs})")
+
+    for epoch in range(start_epoch, epochs + 1):
         # --- Train ---
         model.train()
         train_loss = 0
@@ -380,6 +401,126 @@ def load_vae_encoder(vae_path, policy, device='cpu'):
     policy.load_state_dict(policy_state)
     print(f"[VAE] Loaded {transferred} encoder weights into policy")
     return True
+
+
+def try_load_mavrl_encoder(policy, device='cpu'):
+    """
+    Try to load MAVRL pre-trained encoder weights into policy.
+    Falls back to random weights if loading fails.
+
+    Returns:
+        bool: True if MAVRL weights loaded, False if using random weights
+    """
+    mavrl_dir = Path(config.LEARNING_DIR) / "mavrl_weights" / "RecurrentPPO_1" / "Policy"
+
+    if not mavrl_dir.exists():
+        print("[VAE] No MAVRL weights directory found")
+        return False
+
+    checkpoints = sorted(mavrl_dir.glob("iter_*.pth"))
+    if not checkpoints:
+        print("[VAE] No MAVRL checkpoints found")
+        return False
+
+    ckpt_path = checkpoints[-1]
+    print(f"[VAE] Attempting to load MAVRL encoder from {ckpt_path.name}")
+
+    try:
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        state_dict = checkpoint['state_dict']
+
+        key_map = {
+            'features_extractor.conv1.weight': 'encoder.conv1.weight',
+            'features_extractor.conv1.bias': 'encoder.conv1.bias',
+            'features_extractor.conv2.weight': 'encoder.conv2.weight',
+            'features_extractor.conv2.bias': 'encoder.conv2.bias',
+            'features_extractor.conv3.weight': 'encoder.conv3.weight',
+            'features_extractor.conv3.bias': 'encoder.conv3.bias',
+            'features_extractor.conv4.weight': 'encoder.conv4.weight',
+            'features_extractor.conv4.bias': 'encoder.conv4.bias',
+            'features_extractor.conv5.weight': 'encoder.conv5.weight',
+            'features_extractor.conv5.bias': 'encoder.conv5.bias',
+            'features_extractor.conv6.weight': 'encoder.conv6.weight',
+            'features_extractor.conv6.bias': 'encoder.conv6.bias',
+            'features_extractor.linear.weight': 'encoder.fc_mu.weight',
+            'features_extractor.linear.bias': 'encoder.fc_mu.bias',
+        }
+
+        policy_state = policy.state_dict()
+        transferred = 0
+        for mavrl_key, our_key in key_map.items():
+            if mavrl_key in state_dict and our_key in policy_state:
+                if state_dict[mavrl_key].shape == policy_state[our_key].shape:
+                    policy_state[our_key] = state_dict[mavrl_key]
+                    transferred += 1
+
+        if transferred > 0:
+            policy.load_state_dict(policy_state)
+            print(f"[VAE] MAVRL encoder loaded: {transferred}/{len(key_map)} weights")
+            return True
+        else:
+            print("[VAE] No encoder weights could be transferred")
+            return False
+
+    except Exception as e:
+        print(f"[VAE] Failed to load MAVRL encoder: {e}")
+        print("[VAE] Will train VAE from scratch")
+        return False
+
+
+def try_load_mavrl_lstm(policy, device='cpu'):
+    """
+    Try to load MAVRL pre-trained LSTM weights into policy.
+    Falls back to random weights if loading fails.
+
+    Returns:
+        bool: True if MAVRL weights loaded, False if using random weights
+    """
+    mavrl_dir = Path(config.LEARNING_DIR) / "mavrl_weights" / "RecurrentPPO_1" / "Policy"
+
+    if not mavrl_dir.exists():
+        print("[LSTM] No MAVRL weights directory found")
+        return False
+
+    checkpoints = sorted(mavrl_dir.glob("iter_*.pth"))
+    if not checkpoints:
+        print("[LSTM] No MAVRL checkpoints found")
+        return False
+
+    ckpt_path = checkpoints[-1]
+    print(f"[LSTM] Attempting to load MAVRL LSTM from {ckpt_path.name}")
+
+    try:
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        state_dict = checkpoint['state_dict']
+
+        key_map = {
+            'lstm_actor.weight_ih_l0': 'lstm.weight_ih_l0',
+            'lstm_actor.weight_hh_l0': 'lstm.weight_hh_l0',
+            'lstm_actor.bias_ih_l0': 'lstm.bias_ih_l0',
+            'lstm_actor.bias_hh_l0': 'lstm.bias_hh_l0',
+        }
+
+        policy_state = policy.state_dict()
+        transferred = 0
+        for mavrl_key, our_key in key_map.items():
+            if mavrl_key in state_dict and our_key in policy_state:
+                if state_dict[mavrl_key].shape == policy_state[our_key].shape:
+                    policy_state[our_key] = state_dict[mavrl_key]
+                    transferred += 1
+
+        if transferred > 0:
+            policy.load_state_dict(policy_state)
+            print(f"[LSTM] MAVRL LSTM loaded: {transferred}/{len(key_map)} weights")
+            return True
+        else:
+            print("[LSTM] No LSTM weights could be transferred")
+            return False
+
+    except Exception as e:
+        print(f"[LSTM] Failed to load MAVRL LSTM: {e}")
+        print("[LSTM] Will train LSTM from scratch")
+        return False
 
 
 if __name__ == "__main__":

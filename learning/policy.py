@@ -90,16 +90,17 @@ class RecurrentPolicy(nn.Module):
         # Image encoder (matches MAVRL Encoder exactly)
         self.encoder = DepthEncoder(features_dim)
 
-        # LSTM: input = features(64) + state(7) = 71
-        # No state_fc! Raw state goes directly into LSTM.
+        # LSTM: input = features ONLY (64), state NOT in LSTM
+        # Matching MAVRL: states_dim=0 for LSTM, state concatenated AFTER
         self.lstm = nn.LSTM(
-            input_size=features_dim + states_dim,  # 64 + 7 = 71
+            input_size=features_dim,  # 64 (NO state in LSTM, matching MAVRL)
             hidden_size=lstm_hidden,
             num_layers=1,
             batch_first=True,
         )
 
         # MLP extractor: input = lstm_out(256) + state(7) = 263
+        # State concatenated AFTER LSTM (matching MAVRL forward_rnn)
         mlp_input_size = lstm_hidden + states_dim  # 256 + 7 = 263
 
         # Actor (policy network): 263 -> [256, 256] -> 4
@@ -142,23 +143,19 @@ class RecurrentPolicy(nn.Module):
         img_flat = image.reshape(B * T, 1, 256, 256)
         features = self.encoder(img_flat)  # (B*T, 64)
 
-        # 2. Raw state (NO fc encoding, matching MAVRL)
-        state_flat = state.reshape(B * T, self.states_dim)  # (B*T, 7)
-
-        # 3. LSTM input: [features, state] = 64 + 7 = 71
-        lstm_in = torch.cat([features, state_flat], dim=-1)  # (B*T, 71)
-        lstm_in = lstm_in.reshape(B, T, -1)
+        # 2. LSTM input: features ONLY (matching MAVRL — state NOT in LSTM)
+        lstm_in = features.reshape(B, T, -1)  # (B, T, 64)
 
         if lstm_hidden is None:
             lstm_out, new_hidden = self.lstm(lstm_in)
         else:
             lstm_out, new_hidden = self.lstm(lstm_in, lstm_hidden)
 
-        # 4. MLP input: [lstm_out, state] = 256 + 7 = 263
+        # 3. MLP input: [lstm_out, state] = 256 + 7 = 263
         state_seq = state.reshape(B, T, self.states_dim)
         mlp_in = torch.cat([lstm_out, state_seq], dim=-1)  # (B, T, 263)
 
-        # 5. Actor
+        # 4. Actor
         actor_features = self.actor(mlp_in)
         action_mean = self.action_net(actor_features)  # (B, T, 4)
 
@@ -230,27 +227,23 @@ class RecurrentPolicy(nn.Module):
         Step 1: Run encoder + LSTM. Returns latent vectors for buffer storage.
         Called ONCE during rollout collection.
 
-        Returns:
-            latent_pi: (batch, lstm_hidden + state_dim) = (batch, 263)
-            latent_vf: (batch, lstm_hidden + state_dim) = (batch, 263)
-            new_hidden, new_cell
+        MAVRL flow:
+            features = encoder(image)           # 64-dim
+            latent_pi = LSTM(features)           # 256-dim (NO state in LSTM!)
+            latent_pi = [lstm_out, state]        # 263-dim (state AFTER LSTM)
         """
         B, T = image.shape[:2]
 
-        # Encode images
+        # 1. Encode images
         img_flat = image.reshape(B * T, 1, 256, 256)
         features = self.encoder(img_flat)  # (B*T, 64)
 
-        # Raw state
-        state_flat = state.reshape(B * T, self.states_dim)  # (B*T, 7)
-
-        # LSTM input: [features, state] = 71
-        lstm_in = torch.cat([features, state_flat], dim=-1)
-        lstm_in = lstm_in.reshape(B, T, -1)
+        # 2. LSTM input: features ONLY (NO state, matching MAVRL)
+        lstm_in = features.reshape(B, T, -1)  # (B, T, 64)
 
         lstm_out, new_hidden = self.lstm(lstm_in, lstm_hidden)
 
-        # Latent = [lstm_out, state] = 263
+        # 3. Latent = [lstm_out, state] = 263-dim (state AFTER LSTM)
         state_seq = state.reshape(B, T, self.states_dim)
         latent_pi = torch.cat([lstm_out, state_seq], dim=-1)  # (B, T, 263)
         latent_vf = latent_pi  # Shared (like MAVRL shared_lstm=True)
