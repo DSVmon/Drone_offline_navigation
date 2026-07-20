@@ -232,6 +232,51 @@ class DroneEnv(gym.Env):
                 else:
                     self.collision_detected = False
 
+    def _check_depth_collision(self):
+        """
+        Detect collision using depth map analysis.
+        Fallback for when bumper sensor doesn't work (planar_move limitation).
+
+        Checks ALL regions of depth map:
+        - Left/Right: walls
+        - Top/Bottom: ceiling/floor
+        - Center: obstacles ahead
+        Priority: edges first (walls/ceiling/floor), then center (obstacles)
+        """
+        with self._lock:
+            depth = self.depth_image.copy()
+
+        if depth is None or depth.size == 0:
+            return False
+
+        h, w = depth.shape
+        COLLISION_THRESHOLD = 10  # uint8, ~0.47m
+
+        # Check all zones
+        center_min = depth[int(h*0.2):int(h*0.8), int(w*0.2):int(w*0.8)].min()
+        left_min = depth[h//4:3*h//4, :w//3].min()
+        right_min = depth[h//4:3*h//4, 2*w//3:].min()
+        top_min = depth[:h//4, w//4:3*w//4].min()
+        bottom_min = depth[3*h//4:, w//4:3*w//4].min()
+
+        all_min = min(center_min, left_min, right_min, top_min, bottom_min)
+
+        if all_min < COLLISION_THRESHOLD:
+            # Priority: edges first, then center
+            if top_min < COLLISION_THRESHOLD:
+                self.collision_type = "CEILING"
+            elif bottom_min < COLLISION_THRESHOLD:
+                self.collision_type = "FLOOR"
+            elif left_min < COLLISION_THRESHOLD:
+                self.collision_type = "WALL"
+            elif right_min < COLLISION_THRESHOLD:
+                self.collision_type = "WALL"
+            else:
+                self.collision_type = "OBSTACLE"
+            return True
+
+        return False
+
     # --- Observation building ---
 
     def _world2body(self, world_vel):
@@ -406,6 +451,14 @@ class DroneEnv(gym.Env):
             cx, cy, cz = self.current_x, self.current_y, self.current_z
             vx = self.odom_vx
 
+        # Depth-based collision detection (backup for bumper)
+        if not collision:
+            collision = self._check_depth_collision()
+            if collision:
+                with self._lock:
+                    self.collision_detected = True
+                    self.collision_countdown = 20
+
         stuck = self._check_stuck(vx)
         elapsed = time.time() - self._episode_start_time if self._episode_start_time else 0.0
 
@@ -459,11 +512,12 @@ class DroneEnv(gym.Env):
         terminated = False
         reward = 0.0
 
-        dist_to_goal = np.linalg.norm(pos - self.goal_point)
-
-        # 1. Goal progress (our addition — MAVRL has this built into AvoidBench)
-        prev_dist = np.linalg.norm(
-            np.array([prev_pos[0], prev_pos[1], pos[2]]) - self.goal_point
+        # 2D distance for goal progress (ignore Z — drone may fly at different altitudes)
+        dist_to_goal = math.sqrt(
+            (pos[0] - self.goal_point[0])**2 + (pos[1] - self.goal_point[1])**2
+        )
+        prev_dist = math.sqrt(
+            (prev_pos[0] - self.goal_point[0])**2 + (prev_pos[1] - self.goal_point[1])**2
         )
         progress = prev_dist - dist_to_goal
         reward += config.R_GOAL_COEFF * progress

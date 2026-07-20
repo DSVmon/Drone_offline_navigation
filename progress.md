@@ -583,3 +583,54 @@ Total time: 81.5s
 - `collect_data.py`: добавлена нормализация /255.0 перед encoder
 - `policy.py forward()`: LSTM input исправлен features(64) вместо features+state(71)
 - `train_lstm.py LSTMReconstructor`: LSTM input исправлен features(64) вместо 71
+
+---
+
+## Дата: 20 июля 2026 (Goal fix, collision fix, расширенное тестирование)
+
+### 73. Исправлен Goal Threshold (критический баг)
+**Было:** GOAL_REACHED_THRESHOLD=2.0m (3D distance)
+**Проблема:** Для пещер шире 3.5м дрон НЕ достигал goal даже пролетая всю пещеру
+**Решение:**
+- GOAL_REACHED_THRESHOLD: 2.0 → **5.0m** (покрывает все ширины 2-8м)
+- Goal distance теперь **2D** (игнорируем Z — drone может лететь на разной высоте)
+- Все ширины пещер теперь достижимы
+
+### 74. Исправлен Collision Detection (depth-based)
+**Было:** Bumper sensor не работает (planar_move plugin не генерирует contacts)
+**Стало:** Depth-based collision detection через анализ depth map
+- Проверяет 5 зон: center, left, right, top, bottom
+- Threshold: uint8=10 (~0.47m)
+- Priority: ceiling → floor → wall → obstacle
+- Работает независимо от physics engine
+
+### 75. Расширенное тестирование: 33/33 PASSED
+```
+STAGE 1:  Camera → Depth Map (3 tests)         ✓
+STAGE 2:  drone_env subscriber (1 test)         ✓
+STAGE 3:  Normalization (1 test)                ✓
+STAGE 4:  VAE Transform (1 test)                ✓
+STAGE 5:  DepthEncoder (1 test)                 ✓
+STAGE 6:  State Vector 7-dim (1 test)           ✓
+STAGE 7:  LSTM 64-dim input (2 tests)           ✓
+STAGE 8:  Full Forward (2 tests)                ✓
+STAGE 9:  Collision Detection (5 tests)         ✓
+STAGE 10: Goal Threshold (6 tests)              ✓
+STAGE 11: Stage A PPO (1 test)                  ✓
+STAGE 12: Stage B Collect (1 test)              ✓
+STAGE 13: Stage C VAE (1 test)                  ✓
+STAGE 14: Stage C+ LSTM (2 tests)               ✓
+STAGE 15: Stage D PPO (2 tests)                 ✓
+STAGE 16: Inference (1 test)                    ✓
+TOTAL: 33/33 PASSED (100.0%)
+```
+
+### 76. Ключевые параметры (verified)
+- Camera: 640×480 → uint8 [0,255] → 256×256
+- Normalization: uint8 → float32 [0,1] (/255.0)
+- Encoder: 6×Conv(stride=2) → 1024 → 64-dim
+- LSTM: input=64 (features only), hidden=256
+- MLP: 263-dim → actor [256,256]→4, critic [512,512]→1
+- Collision: depth-based, 5 zones, threshold ~0.47m
+- Goal: 2D distance, threshold=5m, all cave widths reachable
+- Pipeline: A→B→C→C+→D→Inference — ALL PASS

@@ -56,7 +56,7 @@ ACTION_STD = np.array([4.0, 4.0, 1.0, 0.6])
 GOAL_DISTANCE_RATIO = 0.8
 CAVE_LENGTH = 100.0  # meters (all generators produce 100m caves)
 GOAL_Z = 1.75  # target altitude
-GOAL_REACHED_THRESHOLD = 2.0  # meters
+GOAL_REACHED_THRESHOLD = 5.0  # meters (covers caves up to 10m wide)
 
 # --- Network Architecture (MAVRL) ---
 FEATURES_DIM = 64       # VAE latent dim
