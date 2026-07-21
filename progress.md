@@ -634,3 +634,122 @@ TOTAL: 33/33 PASSED (100.0%)
 - Collision: depth-based, 5 zones, threshold ~0.47m
 - Goal: 2D distance, threshold=5m, all cave widths reachable
 - Pipeline: A→B→C→C+→D→Inference — ALL PASS
+
+---
+
+## Дата: 21 июля 2026 (стерео камеры, синхронизация, визуализация)
+
+### 77. Тестирование стерео камеры в Gazebo
+- Проверена работа left/right камер в Gazebo
+- Left camera: 640×480, rgb8, ~6-7 Hz
+- Right camera: 640×480, rgb8, ~1.5-4.7 Hz (нестабильно)
+- Baseline: 0.12m (12 см)
+- StereoBM: 128 disparities, block=15
+- Disparity valid: 65.4% пикселей
+- Depth map: 256×256, mono8, 100% nonzero
+
+### 78. Создан scripts/stereo_viz.py
+- Визуализация стерео камеры в реальном времени
+- Окна: Left CAM, Right CAM, Disparity, Depth (JET)
+- HUD: позиция, yaw, FPS
+- Stereo distances: 5 зон с цветными барами
+- Автосохранение кадров каждые 2 секунды
+
+### 79. Создан scripts/record_stereo.py
+- Запись стерео визуализации в MP4
+- Поддержка H.264 через PyAV
+- CLI: `python3 record_stereo.py <output.mp4> <duration>`
+- Оптимизация: pyrDown для disparity (160×120), cache каждые 2 кадра
+- StereoBM: 64 disparities, block=7 (543 FPS на 160×120)
+
+### 80. Синхронизация камер (критическое исправление)
+**Проблема:** Left 6-7 Hz, Right 1.5-4.7 Hz — disparity неточный из-за запаздывания
+**Решение:**
+- update_rate: 30Hz → 10Hz (обе камеры одинаковые)
+- Добавлен `<always_on>true</always_on>`
+- Результат: time diff = 0.0000s (идеальная синхронизация)
+
+### 81. Увеличение FPS камер
+**Проблема:** 10Hz update_rate → 2-3 FPS (software rendering)
+**Решение:**
+- Разрешение: 640×480 → **320×240** (4x меньше пикселей)
+- update_rate: 10Hz → **20Hz**
+- Результат: **13.1 FPS**, sync diff = 0.0000s
+- Depth map: **17-20 Hz** (было 1-8 Hz)
+
+### 82. URDF обновлён (rescue_drone.urdf.xacro)
+```xml
+<!-- Left Camera -->
+<always_on>true</always_on>
+<update_rate>20.0</update_rate>
+<width>320</width>
+<height>240</height>
+
+<!-- Right Camera -->
+<always_on>true</always_on>
+<update_rate>20.0</update_rate>
+<width>320</width>
+<height>240</height>
+```
+
+### 83. RViz2 сделан опциональным
+**Проблема:** RViz2 оставался после закрытия симуляции
+**Решение:**
+- Добавлен launch argument `rviz` (по умолчанию `false`)
+- Исправлен баг: `launch.conditions.IfCondition` → `IfCondition`
+- Использование: `ros2 launch drone_simulation simulation_launch.py rviz:=true`
+
+### 84. Исправлена кодировка depth map (navigation_node.cpp)
+**Было:** `depth_map_32f.convertTo(depth_map_uint8, CV_8U, 255.0 / 12.0)`
+- 0м (близко) → 0 (синий), 12м (далеко) → 255 (красный) — НЕПРАВИЛЬНО
+
+**Стало:** `depth_map_32f.convertTo(depth_map_uint8, CV_8U, -255.0 / 12.0, 255.0)`
+- 0м (близко) → 255 (красный), 12м (далеко) → 0 (синий) — ПРАВИЛЬНО
+
+### 85. Исправлены подписи stereo distances
+**Было:** `["L", "C-L", "C", "C-R", "R"]` — неправильно
+**Стало:** `["Left", "Center", "Right", "Ceiling", "Floor"]` — правильно
+- Соответствует 5 зонам в navigation_node: L, C, R, Top, Bottom
+
+### 86. Убран disparity из видео
+- Удалено вычисление disparity в record_stereo.py
+- Видео: Left CAM + Right CAM + Depth map (полная ширина)
+
+### 87. Полная проверка пайплайна данных
+```
+[1] CAMERAS:     320×240 uint8 [0..247] ✓
+[2] CALIBRATION: fx=190.68, baseline=0.12m ✓
+[3] DEPTH MAP:   256×256 uint8, inverted (0=far, 255=close) ✓
+[4] STEREO DIST: L=1.91m, C=1.91m, R=2.03m, Ceil=2.03m, Floor=2.03m ✓
+[5] ODOMETRY:    pos=(1.29,0.46,1.55), vel=(0.05,0.00,0.00) ✓
+[6] MODEL INPUT: (1,1,256,256) → float32 [0,1] → 64 → 256 → 263 → 4 ✓
+```
+
+### 88. Проверка модели
+```
+DepthEncoder:  256×256 → 64-dim ✓
+RecurrentPolicy: forward() → action(4), value(1) ✓
+Parameters: 1,627,069 (1627K)
+  Encoder: 764,600 (765K)
+  LSTM:    329,728 (330K)
+  Actor:   134,404 (134K)
+  Critic:  398,337 (398K)
+```
+
+### 89. Записанные видео
+| Файл | Разрешение | FPS | Длительность | Размер |
+|---|---|---|---|---|
+| stereo_visualization.mp4 | 1120×840 | 30 | 25.9s | 4.0 MB |
+
+### 90. Итоговые параметры стерео
+| Параметр | Значение |
+|---|---|
+| Camera resolution | 320×240 |
+| Camera FPS | 13.1 Hz (sync) |
+| Baseline | 0.12 m |
+| StereoBM | 128 disp, block=15 |
+| Depth map | 256×256, mono8 |
+| Depth map FPS | 17-20 Hz |
+| Encoding | Inverted (255=close, 0=far) |
+| Model input | float32 [0,1] |
+| Stereo distances | 5 zones: L, C, R, Ceiling, Floor |

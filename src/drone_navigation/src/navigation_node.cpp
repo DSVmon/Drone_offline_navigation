@@ -239,8 +239,9 @@ private:
       }
 
       // Normalize to [0, 255] uint8 (matching MAVRL format)
+      // Invert: 0m(close)=255(red), 12m(far)=0(blue) for JET colormap
       cv::Mat depth_map_uint8;
-      depth_map_32f.convertTo(depth_map_uint8, CV_8U, 255.0 / 12.0);
+      depth_map_32f.convertTo(depth_map_uint8, CV_8U, -255.0 / 12.0, 255.0);
 
       // Center crop to square (matching MAVRL)
       int crop_size = std::min(depth_map_uint8.cols, depth_map_uint8.rows);

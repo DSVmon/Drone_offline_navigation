@@ -2,6 +2,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, ExecuteProcess
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -9,7 +10,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
     pkg_drone_simulation = get_package_share_directory('drone_simulation')
-    
+
     world_path = os.path.join(pkg_drone_simulation, 'worlds', 'cave.world')
     workspace_root = os.path.abspath(os.path.join(pkg_drone_simulation, '..', '..', '..', '..'))
     scripts_dir = os.path.join(workspace_root, 'scripts')
@@ -20,10 +21,17 @@ def generate_launch_description():
         description='Cave generator script name'
     )
 
+    rviz_arg = DeclareLaunchArgument(
+        'rviz',
+        default_value='false',
+        description='Launch RViz2 (default: false for headless)'
+    )
+
     cave_script = LaunchConfiguration('cave_script')
+    rviz_enabled = LaunchConfiguration('rviz')
 
     generate_cave = ExecuteProcess(
-        cmd=['bash', '-c', 
+        cmd=['bash', '-c',
              'python3 ' + scripts_dir + '/$CAVE_SCRIPT ' + world_path],
         additional_env={'CAVE_SCRIPT': cave_script},
         output='screen'
@@ -44,14 +52,15 @@ def generate_launch_description():
         )
     )
 
-    # RViz2 for visualization
+    # RViz2 for visualization (optional, default off)
     rviz_config_path = os.path.join(pkg_drone_simulation, 'rviz', 'drone_config.rviz')
     rviz = Node(
         package='rviz2',
         executable='rviz2',
         name='rviz2',
         output='screen',
-        arguments=['-d', rviz_config_path]
+        arguments=['-d', rviz_config_path],
+        condition=IfCondition(rviz_enabled),
     )
 
     # Perception Node
@@ -83,6 +92,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         cave_script_arg,
+        rviz_arg,
         generate_cave,
         gazebo,
         spawn_drone,
